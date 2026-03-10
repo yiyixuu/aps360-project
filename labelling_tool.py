@@ -1,0 +1,981 @@
+"""
+Volleyball Set Labelling Tool
+APS360 Project — Data Collection
+
+Usage:
+    python labelling_tool.py
+    Then use File > Open Video to load an MP4.
+
+Controls:
+    Space       — Play / Pause
+    Left/Right  — Step one frame backward / forward
+    Shift+Left  — Jump 1 second back
+    Shift+Right — Jump 1 second forward
+    M           — Mark current frame as set point
+    Enter       — Confirm crop during preview
+    Esc         — Cancel current operation (mark / crop / preview)
+    Ctrl+Q      — Quit
+"""
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import cv2
+import os
+import csv
+import uuid
+import time
+import threading
+import queue
+from PIL import Image, ImageTk
+from datetime import datetime
+
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+DEFAULT_CLIP_DURATION = 1.0        # seconds before the mark
+PLAYBACK_SPEEDS       = [0.25, 0.5, 1.0, 1.5, 2.0]
+SET_DIRECTIONS        = ["Left Side", "Middle", "Right Side", "Pipe", "Dump"]
+
+
+# ─── Main Application ────────────────────────────────────────────────────────
+
+class LabellingTool(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Volleyball Set Labelling Tool")
+        self.configure(bg="#1e1e1e")
+
+        # ── Video state ──
+        self.cap = None
+        self.video_path = None
+        self.total_frames = 0
+        self.fps = 30.0
+        self.frame_width = 0
+        self.frame_height = 0
+        self.current_frame_idx = 0
+        self.current_frame = None       # numpy BGR
+        self.display_scale = 1.0        # ratio: display / original
+        self.playing = False
+        self.play_speed = 1.0
+        self.after_id = None
+
+        # ── Threaded decode state ──
+        self._frame_queue = queue.Queue(maxsize=8)
+        self._decode_thread = None
+        self._decode_stop = threading.Event()
+
+        # ── Display cache ──
+        self._display_w = 0             # pre-computed display dimensions
+        self._display_h = 0
+        self._img_x = 0
+        self._img_y = 0
+        self._canvas_image_id = None    # persistent canvas image item
+
+        # ── Marker / crop state ──
+        self.markers = []               # list of saved clip info
+        self.crop_mode = False
+        self.crop_start = None          # (x, y) in display coords
+        self.crop_rect_id = None        # canvas rectangle id
+        self.pending_marker_frame = None
+        self.clip_duration = DEFAULT_CLIP_DURATION
+
+        # ── Preview playback state ──
+        self.previewing = False
+        self.preview_after_id = None
+        self.preview_crop = None        # (cx, cy, cw, ch) in original coords
+        self.preview_display_rect = None  # (rx0, ry0, rx1, ry1) in display coords
+        self._preview_frames = []       # pre-loaded frames for looping preview
+        self._preview_idx = 0
+
+        # ── Clip output ──
+        self.clips_dir = None
+        self.master_csv_path = None
+
+        # ── Build UI ──
+        self._build_menu()
+        self._build_layout()
+        self._bind_keys()
+
+        # Centre window
+        self.update_idletasks()
+        self.geometry("1200x750")
+        self.minsize(900, 600)
+
+    # ─── Menu Bar ─────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open Video…", command=self._open_video,
+                              accelerator="Ctrl+O")
+        file_menu.add_separator()
+        file_menu.add_command(label="Quit", command=self._quit,
+                              accelerator="Ctrl+Q")
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.config(menu=menubar)
+        self.bind_all("<Control-o>", lambda e: self._open_video())
+        self.bind_all("<Control-q>", lambda e: self._quit())
+
+    # ─── Layout ───────────────────────────────────────────────────────────────
+
+    def _build_layout(self):
+        # Main horizontal split: video area (left) + tool panel (right)
+        self.main_pane = tk.PanedWindow(self, orient=tk.HORIZONTAL,
+                                        bg="#2d2d2d", sashwidth=4)
+        self.main_pane.pack(fill=tk.BOTH, expand=True)
+
+        # ── Left: video + timeline ──
+        left_frame = tk.Frame(self.main_pane, bg="#1e1e1e")
+        self.main_pane.add(left_frame, stretch="always")
+
+        self.canvas = tk.Canvas(left_frame, bg="#000000", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 0))
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # Crop interactions
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+
+        # Timeline
+        timeline_frame = tk.Frame(left_frame, bg="#1e1e1e")
+        timeline_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.time_label = tk.Label(timeline_frame, text="00:00 / 00:00",
+                                   bg="#1e1e1e", fg="white", font=("Menlo", 11))
+        self.time_label.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.timeline = ttk.Scale(timeline_frame, from_=0, to=100,
+                                  orient=tk.HORIZONTAL,
+                                  command=self._on_timeline_seek)
+        self.timeline.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.frame_label = tk.Label(timeline_frame, text="Frame: 0 / 0",
+                                    bg="#1e1e1e", fg="#aaa", font=("Menlo", 10))
+        self.frame_label.pack(side=tk.RIGHT, padx=(8, 0))
+
+        # ── Right: tool panel ──
+        right_frame = tk.Frame(self.main_pane, bg="#2d2d2d", width=260)
+        self.main_pane.add(right_frame, stretch="never")
+
+        pad = dict(padx=12, pady=4)
+        header_font = ("Helvetica", 13, "bold")
+        label_font = ("Helvetica", 11)
+
+        tk.Label(right_frame, text="Controls", font=header_font,
+                 bg="#2d2d2d", fg="white").pack(padx=12, anchor="w", pady=(12, 4))
+
+        # Play / Pause button
+        self.play_btn = tk.Button(right_frame, text="▶  Play", width=20,
+                                  command=self._toggle_play,
+                                  font=label_font)
+        self.play_btn.pack(**pad)
+
+        # Playback speed
+        speed_frame = tk.Frame(right_frame, bg="#2d2d2d")
+        speed_frame.pack(**pad, fill=tk.X)
+        tk.Label(speed_frame, text="Speed:", bg="#2d2d2d", fg="white",
+                 font=label_font).pack(side=tk.LEFT)
+        self.speed_var = tk.StringVar(value="1.0×")
+        self.speed_combo = ttk.Combobox(speed_frame, textvariable=self.speed_var,
+                                        values=[f"{s}×" for s in PLAYBACK_SPEEDS],
+                                        width=6, state="readonly")
+        self.speed_combo.pack(side=tk.LEFT, padx=(8, 0))
+        self.speed_combo.bind("<<ComboboxSelected>>", self._on_speed_change)
+
+        ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+
+        # ── Clip settings ──
+        tk.Label(right_frame, text="Clip Settings", font=header_font,
+                 bg="#2d2d2d", fg="white").pack(**pad, anchor="w")
+
+        dur_frame = tk.Frame(right_frame, bg="#2d2d2d")
+        dur_frame.pack(**pad, fill=tk.X)
+        tk.Label(dur_frame, text="Clip length (sec):", bg="#2d2d2d", fg="white",
+                 font=label_font).pack(side=tk.LEFT)
+        self.dur_var = tk.StringVar(value=str(DEFAULT_CLIP_DURATION))
+        self.dur_entry = tk.Entry(dur_frame, textvariable=self.dur_var, width=6,
+                                  font=label_font)
+        self.dur_entry.pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+
+        # ── Mark set ──
+        tk.Label(right_frame, text="Labelling", font=header_font,
+                 bg="#2d2d2d", fg="white").pack(**pad, anchor="w")
+
+        self.mark_btn = tk.Button(right_frame, text="⚑  Mark Set (M)", width=20,
+                                  command=self._mark_set, font=label_font,
+                                  bg="#c0392b", fg="white",
+                                  activebackground="#e74c3c")
+        self.mark_btn.pack(padx=12, pady=(0, 4))
+
+        # Confirm button (shown during preview)
+        self.confirm_btn = tk.Button(right_frame, text="✓  Confirm Crop (Enter)",
+                                     width=20, command=self._confirm_preview,
+                                     font=label_font, bg="#27ae60", fg="white",
+                                     activebackground="#2ecc71")
+        self.confirm_btn.pack(padx=12, pady=(0, 4))
+        self.confirm_btn.pack_forget()  # hidden by default
+
+        # Cancel button
+        self.cancel_btn = tk.Button(right_frame, text="✕  Cancel (Esc)", width=20,
+                                    command=self._cancel_all, font=label_font,
+                                    state=tk.DISABLED)
+        self.cancel_btn.pack(padx=12, pady=(0, 4))
+
+        self.status_label = tk.Label(right_frame, text="Load a video to begin.",
+                                     bg="#2d2d2d", fg="#aaa", font=label_font,
+                                     wraplength=230, justify=tk.LEFT)
+        self.status_label.pack(**pad, anchor="w")
+
+        ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+
+        # ── Markers list ──
+        tk.Label(right_frame, text="Saved Clips", font=header_font,
+                 bg="#2d2d2d", fg="white").pack(**pad, anchor="w")
+
+        self.marker_listbox = tk.Listbox(right_frame, bg="#1e1e1e", fg="white",
+                                         font=("Menlo", 10), selectbackground="#444",
+                                         height=10)
+        self.marker_listbox.pack(padx=12, fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        # ── Quit button ──
+        ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+        self.quit_btn = tk.Button(right_frame, text="Quit (Ctrl+Q)", width=20,
+                                  command=self._quit, font=label_font)
+        self.quit_btn.pack(padx=12, pady=(4, 12))
+
+    # ─── Keyboard Bindings ────────────────────────────────────────────────────
+
+    def _bind_keys(self):
+        self.bind("<space>", lambda e: self._toggle_play())
+        self.bind("<Left>", lambda e: self._step_frame(-1))
+        self.bind("<Right>", lambda e: self._step_frame(1))
+        self.bind("<Shift-Left>", lambda e: self._jump_seconds(-1))
+        self.bind("<Shift-Right>", lambda e: self._jump_seconds(1))
+        self.bind("<m>", lambda e: self._mark_set())
+        self.bind("<M>", lambda e: self._mark_set())
+        self.bind("<Escape>", lambda e: self._cancel_all())
+        self.bind("<Return>", lambda e: self._confirm_preview())
+
+    # ─── Video Loading ────────────────────────────────────────────────────────
+
+    def _open_video(self):
+        path = filedialog.askopenfilename(
+            title="Select a video file",
+            filetypes=[("Video files", "*.mp4 *.mov *.avi *.mkv"), ("All", "*.*")]
+        )
+        if not path:
+            return
+        self._load_video(path)
+
+    def _load_video(self, path):
+        self._stop_decode_thread()
+        if self.cap is not None:
+            self.cap.release()
+            self.playing = False
+
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", f"Cannot open video:\n{path}")
+            return
+
+        self.video_path = path
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.current_frame_idx = 0
+
+        # Set up output directory in the same folder as this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.clips_dir = os.path.join(script_dir, "clips")
+        os.makedirs(self.clips_dir, exist_ok=True)
+        self.master_csv_path = os.path.join(self.clips_dir, "labels.csv")
+
+        # Initialise CSV if it doesn't exist
+        if not os.path.exists(self.master_csv_path):
+            with open(self.master_csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["clip_id", "source_video", "mark_frame",
+                                 "start_frame", "end_frame", "clip_duration_sec",
+                                 "crop_x", "crop_y", "crop_w", "crop_h",
+                                 "set_direction", "timestamp"])
+
+        # Pre-compute display dimensions
+        self._recompute_display_size()
+
+        self.timeline.configure(to=max(self.total_frames - 1, 1))
+        self._seek_frame(0)
+        self._update_status(
+            f"Video loaded ({self.total_frames} frames, {self.fps:.1f} fps).\n"
+            "Navigate and press M to mark a set.")
+        self.title(f"Volleyball Set Labelling Tool — {os.path.basename(path)}")
+        self.markers.clear()
+        self.marker_listbox.delete(0, tk.END)
+
+    # ─── Display Helpers ──────────────────────────────────────────────────────
+
+    def _recompute_display_size(self):
+        """Pre-compute the display dimensions for the current canvas size."""
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw < 10 or ch < 10 or self.frame_width == 0:
+            return
+        scale = min(cw / self.frame_width, ch / self.frame_height)
+        self.display_scale = scale
+        self._display_w = int(self.frame_width * scale)
+        self._display_h = int(self.frame_height * scale)
+        self._img_x = (cw - self._display_w) // 2
+        self._img_y = (ch - self._display_h) // 2
+
+    def _frame_to_photo(self, frame):
+        """Convert a BGR numpy frame to an ImageTk.PhotoImage (fast path)."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (self._display_w, self._display_h),
+                             interpolation=cv2.INTER_NEAREST)
+        img = Image.fromarray(resized)
+        return ImageTk.PhotoImage(image=img)
+
+    # ─── Frame Display ────────────────────────────────────────────────────────
+
+    def _seek_frame(self, idx):
+        """Seek to a specific frame by index (random access)."""
+        if self.cap is None:
+            return
+        idx = max(0, min(idx, self.total_frames - 1))
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = self.cap.read()
+        if ret:
+            self.current_frame_idx = idx
+            self.current_frame = frame
+            self._display_frame(frame)
+            self._update_timeline()
+
+    def _display_frame(self, frame, crop_overlay=None):
+        """Render an OpenCV BGR frame onto the tkinter canvas."""
+        if self._display_w < 1 or self._display_h < 1:
+            self._recompute_display_size()
+            if self._display_w < 1:
+                return
+
+        self._photo = self._frame_to_photo(frame)
+
+        # Reuse existing canvas image item if possible
+        if self._canvas_image_id is not None:
+            self.canvas.itemconfig(self._canvas_image_id, image=self._photo)
+            self.canvas.coords(self._canvas_image_id, self._img_x, self._img_y)
+        else:
+            self.canvas.delete("all")
+            self._canvas_image_id = self.canvas.create_image(
+                self._img_x, self._img_y, anchor=tk.NW, image=self._photo)
+
+        # Remove old overlays
+        self.canvas.delete("overlay")
+
+        # Draw crop rectangle overlay during preview
+        if crop_overlay:
+            rx0, ry0, rx1, ry1 = crop_overlay
+            self.canvas.create_rectangle(
+                rx0, ry0, rx1, ry1,
+                outline="#ffcc00", width=2, dash=(6, 3), tags="overlay")
+
+        # If in crop mode, show instruction overlay
+        cw = self.canvas.winfo_width()
+        if self.crop_mode and not self.previewing:
+            self.canvas.create_text(cw // 2, 25,
+                                    text="Draw a rectangle around the setter, then release",
+                                    fill="#ffcc00", font=("Helvetica", 14, "bold"),
+                                    tags="overlay")
+
+        # If previewing, show preview label
+        if self.previewing:
+            self.canvas.create_text(cw // 2, 25,
+                                    text="Previewing clip (looping) — Enter to confirm, Esc to cancel",
+                                    fill="#00ccff", font=("Helvetica", 14, "bold"),
+                                    tags="overlay")
+
+    def _display_frame_fast(self, photo, crop_overlay=None):
+        """Display a pre-converted PhotoImage (fastest path for playback)."""
+        self._photo = photo
+        if self._canvas_image_id is not None:
+            self.canvas.itemconfig(self._canvas_image_id, image=self._photo)
+        else:
+            self.canvas.delete("all")
+            self._canvas_image_id = self.canvas.create_image(
+                self._img_x, self._img_y, anchor=tk.NW, image=self._photo)
+
+        self.canvas.delete("overlay")
+        if crop_overlay:
+            rx0, ry0, rx1, ry1 = crop_overlay
+            self.canvas.create_rectangle(
+                rx0, ry0, rx1, ry1,
+                outline="#ffcc00", width=2, dash=(6, 3), tags="overlay")
+
+    def _on_canvas_resize(self, event):
+        self._canvas_image_id = None  # invalidate cached canvas item
+        self._recompute_display_size()
+        if self.current_frame is not None:
+            self._display_frame(self.current_frame)
+
+    def _update_timeline(self):
+        self.timeline.set(self.current_frame_idx)
+        total_sec = self.total_frames / self.fps
+        cur_sec = self.current_frame_idx / self.fps
+        self.time_label.config(
+            text=f"{self._fmt_time(cur_sec)} / {self._fmt_time(total_sec)}")
+        self.frame_label.config(
+            text=f"Frame: {self.current_frame_idx} / {self.total_frames - 1}")
+
+    @staticmethod
+    def _fmt_time(seconds):
+        m, s = divmod(int(seconds), 60)
+        return f"{m:02d}:{s:02d}"
+
+    # ─── Threaded Decode ──────────────────────────────────────────────────────
+
+    def _decode_worker(self, cap_path, start_idx):
+        """Background thread: decode raw frames only (no tkinter calls)."""
+        cap = cv2.VideoCapture(cap_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+        idx = start_idx
+        while not self._decode_stop.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                self._frame_queue.put((idx, frame), timeout=0.1)
+            except queue.Full:
+                if self._decode_stop.is_set():
+                    break
+                continue
+            idx += 1
+        cap.release()
+
+    def _start_decode_thread(self, start_idx):
+        self._stop_decode_thread()
+        self._decode_stop.clear()
+        # Drain the queue
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._decode_thread = threading.Thread(
+            target=self._decode_worker,
+            args=(self.video_path, start_idx),
+            daemon=True)
+        self._decode_thread.start()
+
+    def _stop_decode_thread(self):
+        self._decode_stop.set()
+        if self._decode_thread is not None:
+            self._decode_thread.join(timeout=1.0)
+            self._decode_thread = None
+        # Drain queue
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    # ─── Playback ─────────────────────────────────────────────────────────────
+
+    def _toggle_play(self):
+        if self.cap is None:
+            return
+        if self.crop_mode or self.previewing:
+            return
+        self.playing = not self.playing
+        self.play_btn.config(text="⏸  Pause" if self.playing else "▶  Play")
+        if self.playing:
+            # Start decode thread from next frame
+            self._start_decode_thread(self.current_frame_idx + 1)
+            self._play_start_time = time.perf_counter()
+            self._play_start_frame = self.current_frame_idx
+            self._play_loop()
+
+    def _play_loop(self):
+        if not self.playing or self.cap is None:
+            return
+
+        try:
+            idx, frame = self._frame_queue.get_nowait()
+        except queue.Empty:
+            # No frame ready yet, try again soon
+            self.after_id = self.after(2, self._play_loop)
+            return
+
+        if idx >= self.total_frames:
+            self._pause()
+            return
+
+        self.current_frame_idx = idx
+        self.current_frame = frame
+        # Convert to PhotoImage on main thread (tkinter is not thread-safe)
+        photo = self._frame_to_photo(frame)
+        self._display_frame_fast(photo)
+        self._update_timeline()
+
+        # Time-based scheduling: compute when the next frame should appear
+        elapsed = time.perf_counter() - self._play_start_time
+        frames_played = idx - self._play_start_frame
+        target_time = frames_played / (self.fps * self.play_speed)
+        delay_sec = target_time - elapsed
+        delay_ms = max(1, int(delay_sec * 1000))
+
+        self.after_id = self.after(delay_ms, self._play_loop)
+
+    def _step_frame(self, delta):
+        if self.cap is None or self.crop_mode or self.previewing:
+            return
+        self._pause()
+        self._seek_frame(self.current_frame_idx + delta)
+
+    def _jump_seconds(self, sec):
+        if self.cap is None or self.crop_mode or self.previewing:
+            return
+        self._pause()
+        delta_frames = int(sec * self.fps)
+        self._seek_frame(self.current_frame_idx + delta_frames)
+
+    def _pause(self):
+        self.playing = False
+        self.play_btn.config(text="▶  Play")
+        self._stop_decode_thread()
+        if self.after_id is not None:
+            self.after_cancel(self.after_id)
+            self.after_id = None
+
+    def _on_timeline_seek(self, val):
+        if self.cap is None:
+            return
+        idx = int(float(val))
+        if idx != self.current_frame_idx:
+            self._pause()
+            self._seek_frame(idx)
+
+    def _on_speed_change(self, event):
+        txt = self.speed_var.get().replace("×", "")
+        try:
+            self.play_speed = float(txt)
+        except ValueError:
+            self.play_speed = 1.0
+
+    # ─── Cancel All ───────────────────────────────────────────────────────────
+
+    def _cancel_all(self):
+        """Cancel any active operation: preview, crop, or mark."""
+        if self.previewing:
+            self._cancel_preview()
+        elif self.crop_mode:
+            self._cancel_crop()
+
+    def _set_cancel_enabled(self, enabled):
+        self.cancel_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    # ─── Marking & Cropping ───────────────────────────────────────────────────
+
+    def _mark_set(self):
+        if self.cap is None:
+            messagebox.showinfo("No video", "Please open a video first.")
+            return
+        if self.crop_mode or self.previewing:
+            return
+
+        self._pause()
+        self.pending_marker_frame = self.current_frame_idx
+        self.crop_mode = True
+        self.crop_start = None
+        self.crop_rect_id = None
+        self.canvas.config(cursor="crosshair")
+        self._set_cancel_enabled(True)
+        self._update_status(
+            f"Marked frame {self.current_frame_idx}.\n"
+            "Now draw a crop rectangle around the setter.")
+        if self.current_frame is not None:
+            self._display_frame(self.current_frame)
+
+    def _cancel_crop(self):
+        """Cancel crop mode and return to normal navigation."""
+        self.crop_mode = False
+        self.crop_start = None
+        self.pending_marker_frame = None
+        self.canvas.config(cursor="")
+        self._set_cancel_enabled(False)
+        self.confirm_btn.pack_forget()
+        if self.crop_rect_id:
+            self.canvas.delete(self.crop_rect_id)
+            self.crop_rect_id = None
+        self._update_status("Cancelled.")
+        if self.current_frame is not None:
+            self._display_frame(self.current_frame)
+
+    def _on_canvas_press(self, event):
+        if not self.crop_mode or self.previewing:
+            return
+        self.crop_start = (event.x, event.y)
+
+    def _on_canvas_drag(self, event):
+        if not self.crop_mode or self.crop_start is None or self.previewing:
+            return
+        if self.crop_rect_id:
+            self.canvas.delete(self.crop_rect_id)
+        x0, y0 = self.crop_start
+        self.crop_rect_id = self.canvas.create_rectangle(
+            x0, y0, event.x, event.y,
+            outline="#ffcc00", width=2, dash=(6, 3))
+
+    def _on_canvas_release(self, event):
+        if not self.crop_mode or self.crop_start is None or self.previewing:
+            return
+
+        x0, y0 = self.crop_start
+        x1, y1 = event.x, event.y
+
+        if abs(x1 - x0) < 10 or abs(y1 - y0) < 10:
+            return
+
+        rx0, ry0 = min(x0, x1), min(y0, y1)
+        rx1, ry1 = max(x0, x1), max(y0, y1)
+
+        img_x = self._img_x
+        img_y = self._img_y
+        scale = self.display_scale
+
+        crop_x = max(0, int((rx0 - img_x) / scale))
+        crop_y = max(0, int((ry0 - img_y) / scale))
+        crop_w = min(self.frame_width - crop_x, int((rx1 - rx0) / scale))
+        crop_h = min(self.frame_height - crop_y, int((ry1 - ry0) / scale))
+
+        if crop_w < 5 or crop_h < 5:
+            self._update_status("Crop region too small. Try again.")
+            return
+
+        self.preview_crop = (crop_x, crop_y, crop_w, crop_h)
+        self.preview_display_rect = (rx0, ry0, rx1, ry1)
+        self._start_preview()
+
+    # ─── Preview Playback (looping) ───────────────────────────────────────────
+
+    def _start_preview(self):
+        """Pre-load all clip frames, then loop them with the crop overlay."""
+        try:
+            clip_dur = float(self.dur_var.get())
+            if clip_dur <= 0:
+                raise ValueError
+        except ValueError:
+            clip_dur = DEFAULT_CLIP_DURATION
+
+        mark_frame = self.pending_marker_frame
+        num_frames = int(clip_dur * self.fps)
+        start_frame = max(0, mark_frame - num_frames + 1)
+
+        self._update_status("Loading preview frames…")
+        self.update_idletasks()
+
+        # Pre-load all frames for smooth looping
+        self._preview_frames = []
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        for i in range(start_frame, mark_frame + 1):
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            photo = self._frame_to_photo(frame)
+            self._preview_frames.append((i, frame, photo))
+
+        if not self._preview_frames:
+            self._update_status("Failed to load preview frames.")
+            return
+
+        self.previewing = True
+        self._preview_idx = 0
+        self.canvas.config(cursor="")
+
+        # Show confirm button
+        self.confirm_btn.pack(padx=12, pady=(0, 4))
+
+        self._update_status(
+            f"Previewing {clip_dur}s clip (looping).\n"
+            "Press Enter or click Confirm when satisfied.\n"
+            "Press Esc to cancel and redraw.")
+
+        self._preview_loop()
+
+    def _preview_loop(self):
+        """Play pre-loaded frames in a loop with the crop overlay."""
+        if not self.previewing or not self._preview_frames:
+            return
+
+        idx, frame, photo = self._preview_frames[self._preview_idx]
+        self.current_frame_idx = idx
+        self.current_frame = frame
+        self._display_frame_fast(photo, crop_overlay=self.preview_display_rect)
+        self._update_timeline()
+
+        # Show looping overlay text
+        cw = self.canvas.winfo_width()
+        self.canvas.delete("overlay_text")
+        self.canvas.create_text(cw // 2, 25,
+                                text="Previewing clip (looping) — Enter to confirm, Esc to cancel",
+                                fill="#00ccff", font=("Helvetica", 14, "bold"),
+                                tags="overlay_text")
+
+        self._preview_idx += 1
+        if self._preview_idx >= len(self._preview_frames):
+            self._preview_idx = 0  # loop back to start
+
+        delay = max(1, int(1000 / self.fps))
+        self.preview_after_id = self.after(delay, self._preview_loop)
+
+    def _confirm_preview(self):
+        """User confirmed the crop — show the label dialog."""
+        if not self.previewing:
+            return
+
+        # Stop the preview loop
+        self.previewing = False
+        if self.preview_after_id is not None:
+            self.after_cancel(self.preview_after_id)
+            self.preview_after_id = None
+
+        self.confirm_btn.pack_forget()
+
+        # Show the last frame of the clip
+        if self._preview_frames:
+            last_idx, last_frame, last_photo = self._preview_frames[-1]
+            self.current_frame_idx = last_idx
+            self.current_frame = last_frame
+            self._display_frame_fast(last_photo, crop_overlay=self.preview_display_rect)
+
+        self._preview_frames = []  # free memory
+
+        cx, cy, cw, ch = self.preview_crop
+        self._show_crop_confirm(cx, cy, cw, ch)
+
+    def _cancel_preview(self):
+        """Cancel the preview playback and return to crop mode."""
+        self.previewing = False
+        if self.preview_after_id is not None:
+            self.after_cancel(self.preview_after_id)
+            self.preview_after_id = None
+        self.preview_crop = None
+        self.preview_display_rect = None
+        self._preview_frames = []
+        self.confirm_btn.pack_forget()
+
+        if self.pending_marker_frame is not None:
+            self._seek_frame(self.pending_marker_frame)
+        self.crop_mode = True
+        self.crop_start = None
+        self.crop_rect_id = None
+        self.canvas.config(cursor="crosshair")
+        self._update_status(
+            "Preview cancelled. Draw a new crop rectangle, or press Esc to cancel the mark.")
+        if self.current_frame is not None:
+            self._display_frame(self.current_frame)
+
+    # ─── Crop Confirmation Dialog ─────────────────────────────────────────────
+
+    def _show_crop_confirm(self, cx, cy, cw, ch):
+        """Show a dialog asking for the set direction label."""
+        preview_frame = self.current_frame[cy:cy+ch, cx:cx+cw]
+        preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+
+        max_preview = 400
+        ph, pw = preview_rgb.shape[:2]
+        pscale = min(max_preview / pw, max_preview / ph, 1.0)
+        disp_w, disp_h = int(pw * pscale), int(ph * pscale)
+        preview_resized = cv2.resize(preview_rgb, (disp_w, disp_h))
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Label Set Direction")
+        dlg.configure(bg="#2d2d2d")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text="Cropped Region (last frame)",
+                 font=("Helvetica", 13, "bold"),
+                 bg="#2d2d2d", fg="white").pack(padx=12, pady=(12, 4))
+
+        img = Image.fromarray(preview_resized)
+        photo = ImageTk.PhotoImage(image=img)
+        img_label = tk.Label(dlg, image=photo, bg="#1e1e1e")
+        img_label.image = photo
+        img_label.pack(padx=12, pady=4)
+
+        tk.Label(dlg, text="Set Direction (required):",
+                 font=("Helvetica", 11), bg="#2d2d2d", fg="white"
+                 ).pack(padx=12, pady=(8, 2), anchor="w")
+
+        dir_var = tk.StringVar(value="")
+        for d in SET_DIRECTIONS:
+            tk.Radiobutton(dlg, text=d, variable=dir_var, value=d,
+                           bg="#2d2d2d", fg="white", selectcolor="#444",
+                           activebackground="#2d2d2d", activeforeground="white",
+                           font=("Helvetica", 11)
+                           ).pack(padx=24, anchor="w")
+
+        btn_frame = tk.Frame(dlg, bg="#2d2d2d")
+        btn_frame.pack(padx=12, pady=12, fill=tk.X)
+
+        def on_save():
+            direction = dir_var.get()
+            if not direction:
+                messagebox.showwarning("Label required",
+                                       "Please select a set direction before saving.",
+                                       parent=dlg)
+                return
+            dlg.destroy()
+            self._save_clip(cx, cy, cw, ch, direction)
+
+        def on_cancel():
+            dlg.destroy()
+            self._cancel_crop()
+
+        def on_redo():
+            dlg.destroy()
+            self._cancel_preview()
+
+        tk.Button(btn_frame, text="Save Clip", command=on_save,
+                  bg="#27ae60", fg="white", font=("Helvetica", 11, "bold"),
+                  width=10).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(btn_frame, text="Redo Crop", command=on_redo,
+                  font=("Helvetica", 11), width=10).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(btn_frame, text="Cancel", command=on_cancel,
+                  font=("Helvetica", 11), width=10).pack(side=tk.LEFT)
+
+        dlg.bind("<Escape>", lambda e: on_cancel())
+
+        dlg.update_idletasks()
+        dw, dh = dlg.winfo_width(), dlg.winfo_height()
+        px, py = self.winfo_x(), self.winfo_y()
+        pw2, ph2 = self.winfo_width(), self.winfo_height()
+        dlg.geometry(f"+{px + (pw2 - dw) // 2}+{py + (ph2 - dh) // 2}")
+
+    # ─── Clip Saving ──────────────────────────────────────────────────────────
+
+    def _save_clip(self, cx, cy, cw, ch, direction):
+        """Extract the cropped clip and write it as MP4."""
+        try:
+            clip_dur = float(self.dur_var.get())
+            if clip_dur <= 0:
+                raise ValueError
+        except ValueError:
+            clip_dur = DEFAULT_CLIP_DURATION
+            self.dur_var.set(str(clip_dur))
+
+        mark_frame = self.pending_marker_frame
+        num_frames = int(clip_dur * self.fps)
+        start_frame = max(0, mark_frame - num_frames + 1)
+        end_frame = mark_frame
+
+        clip_id = uuid.uuid4().hex[:10]
+        filename = f"{clip_id}.mp4"
+        out_path = os.path.join(self.clips_dir, filename)
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, self.fps, (cw, ch))
+
+        if not writer.isOpened():
+            messagebox.showerror("Error",
+                                 f"Failed to create video writer.\n"
+                                 f"Path: {out_path}\n"
+                                 f"Size: {cw}x{ch}")
+            self._cancel_crop()
+            return
+
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames_written = 0
+        for i in range(start_frame, end_frame + 1):
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            cropped = frame[cy:cy+ch, cx:cx+cw]
+            writer.write(cropped)
+            frames_written += 1
+        writer.release()
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            messagebox.showerror("Error", f"Clip file was not saved properly:\n{out_path}")
+            self._cancel_crop()
+            return
+
+        self._seek_frame(mark_frame)
+
+        with open(self.master_csv_path, "a", newline="") as f:
+            csv_writer = csv.writer(f)
+            csv_writer.writerow([
+                clip_id,
+                os.path.basename(self.video_path),
+                mark_frame,
+                start_frame,
+                end_frame,
+                clip_dur,
+                cx, cy, cw, ch,
+                direction,
+                datetime.now().isoformat(timespec="seconds")
+            ])
+
+        # Finish crop mode
+        self.crop_mode = False
+        self.crop_start = None
+        self.pending_marker_frame = None
+        self.preview_crop = None
+        self.preview_display_rect = None
+        self.canvas.config(cursor="")
+        self._set_cancel_enabled(False)
+        self.confirm_btn.pack_forget()
+        if self.crop_rect_id:
+            self.canvas.delete(self.crop_rect_id)
+            self.crop_rect_id = None
+
+        self.markers.append((mark_frame, clip_id, direction))
+        frame_time = self._fmt_time(mark_frame / self.fps)
+        self.marker_listbox.insert(
+            tk.END,
+            f"{clip_id}  |  {frame_time}  |  {direction}")
+
+        self._update_status(
+            f"Saved: {filename} ({direction})\n"
+            f"{frames_written} frames, {cw}x{ch}\n"
+            f"→ {self.clips_dir}")
+
+        if self.current_frame is not None:
+            self._display_frame(self.current_frame)
+
+    # ─── Helpers ──────────────────────────────────────────────────────────────
+
+    def _update_status(self, msg):
+        self.status_label.config(text=msg)
+
+    # ─── Quit / Cleanup ───────────────────────────────────────────────────────
+
+    def _quit(self):
+        if self.markers:
+            if not messagebox.askyesno("Quit",
+                                       f"{len(self.markers)} clips saved this session.\n"
+                                       "Are you sure you want to quit?"):
+                return
+        self.destroy()
+
+    def destroy(self):
+        self.playing = False
+        self.previewing = False
+        self._stop_decode_thread()
+        if self.after_id is not None:
+            self.after_cancel(self.after_id)
+        if self.preview_after_id is not None:
+            self.after_cancel(self.preview_after_id)
+        if self.cap is not None:
+            self.cap.release()
+        super().destroy()
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app = LabellingTool()
+    app.mainloop()
