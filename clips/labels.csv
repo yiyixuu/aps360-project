@@ -1,2 +1,2 @@
-clip_id,source_video,mark_frame,start_frame,end_frame,clip_duration_sec,crop_x,crop_y,crop_w,crop_h,set_direction,timestamp
-644f97c482,"Top 50 Fantastic Volleyball Sets - Epic Volleyball (720p, h264, youtube).mp4",90,66,90,1.0,280,83,663,435,Middle,2026-03-09T23:53:13
+clip_id,source_video,mark_frame,start_frame,end_frame,clip_duration_sec,crop_x,crop_y,crop_w,crop_h,set_direction,setter_x,setter_y,timestamp
+95722a9b1f,Long Beach VS Pepperdine Men’s Volleyball Exhibition Match-854x480-avc1-mp4a.mp4,24176,24147,24176,1.0,398,103,118,205,Right Side,97,110,2026-03-11T13:33:55

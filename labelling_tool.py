@@ -301,7 +301,8 @@ class LabellingTool(tk.Tk):
                 writer.writerow(["clip_id", "source_video", "mark_frame",
                                  "start_frame", "end_frame", "clip_duration_sec",
                                  "crop_x", "crop_y", "crop_w", "crop_h",
-                                 "set_direction", "timestamp"])
+                                 "set_direction", "setter_x", "setter_y",
+                                 "timestamp"])
 
         # Pre-compute display dimensions
         self._recompute_display_size()
@@ -742,8 +743,10 @@ class LabellingTool(tk.Tk):
 
         self.confirm_btn.pack_forget()
 
-        # Show the last frame of the clip
+        # Grab first frame (for setter position marking) and last frame
+        first_frame = None
         if self._preview_frames:
+            _first_idx, first_frame, _first_photo = self._preview_frames[0]
             last_idx, last_frame, last_photo = self._preview_frames[-1]
             self.current_frame_idx = last_idx
             self.current_frame = last_frame
@@ -752,7 +755,7 @@ class LabellingTool(tk.Tk):
         self._preview_frames = []  # free memory
 
         cx, cy, cw, ch = self.preview_crop
-        self._show_crop_confirm(cx, cy, cw, ch)
+        self._show_crop_confirm(cx, cy, cw, ch, first_frame)
 
     def _cancel_preview(self):
         """Cancel the preview playback and return to crop mode."""
@@ -778,9 +781,11 @@ class LabellingTool(tk.Tk):
 
     # ─── Crop Confirmation Dialog ─────────────────────────────────────────────
 
-    def _show_crop_confirm(self, cx, cy, cw, ch):
-        """Show a dialog asking for the set direction label."""
-        preview_frame = self.current_frame[cy:cy+ch, cx:cx+cw]
+    def _show_crop_confirm(self, cx, cy, cw, ch, first_frame=None):
+        """Show a dialog asking for set direction + setter position on first frame."""
+        # Use first frame for the setter-position click target
+        source_frame = first_frame if first_frame is not None else self.current_frame
+        preview_frame = source_frame[cy:cy+ch, cx:cx+cw]
         preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
 
         max_preview = 400
@@ -790,22 +795,66 @@ class LabellingTool(tk.Tk):
         preview_resized = cv2.resize(preview_rgb, (disp_w, disp_h))
 
         dlg = tk.Toplevel(self)
-        dlg.title("Label Set Direction")
+        dlg.title("Label Set Direction & Setter Position")
         dlg.configure(bg="#2d2d2d")
         dlg.transient(self)
         dlg.grab_set()
         dlg.resizable(False, False)
 
-        tk.Label(dlg, text="Cropped Region (last frame)",
+        tk.Label(dlg, text="First frame — click on the setter",
                  font=("Helvetica", 13, "bold"),
                  bg="#2d2d2d", fg="white").pack(padx=12, pady=(12, 4))
 
+        # ── Clickable canvas for setter position ──
         img = Image.fromarray(preview_resized)
         photo = ImageTk.PhotoImage(image=img)
-        img_label = tk.Label(dlg, image=photo, bg="#1e1e1e")
-        img_label.image = photo
-        img_label.pack(padx=12, pady=4)
 
+        img_canvas = tk.Canvas(dlg, width=disp_w, height=disp_h,
+                               bg="#1e1e1e", highlightthickness=0,
+                               cursor="crosshair")
+        img_canvas.pack(padx=12, pady=4)
+        img_canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        img_canvas.image = photo  # prevent GC
+
+        setter_pos = [None]     # mutable; will hold (crop_x, crop_y)
+        marker_ids = []         # canvas item ids for the crosshair
+
+        def on_canvas_click(event):
+            # Remove previous marker
+            for mid in marker_ids:
+                img_canvas.delete(mid)
+            marker_ids.clear()
+
+            x, y = event.x, event.y
+            # Clamp to image bounds
+            x = max(0, min(x, disp_w - 1))
+            y = max(0, min(y, disp_h - 1))
+
+            # Draw crosshair + circle
+            r = 7
+            marker_ids.append(img_canvas.create_oval(
+                x - r, y - r, x + r, y + r,
+                outline="#ff3333", width=2))
+            marker_ids.append(img_canvas.create_line(
+                x - r - 4, y, x + r + 4, y, fill="#ff3333", width=2))
+            marker_ids.append(img_canvas.create_line(
+                x, y - r - 4, x, y + r + 4, fill="#ff3333", width=2))
+
+            # Convert display coords → crop coords (original pixel space)
+            crop_rel_x = int(round(x / pscale))
+            crop_rel_y = int(round(y / pscale))
+            setter_pos[0] = (crop_rel_x, crop_rel_y)
+            setter_label.config(
+                text=f"Setter marked at ({crop_rel_x}, {crop_rel_y}) in crop",
+                fg="#33ff66")
+
+        img_canvas.bind("<Button-1>", on_canvas_click)
+
+        setter_label = tk.Label(dlg, text="⬆ Click on the setter above (required)",
+                                font=("Helvetica", 10), bg="#2d2d2d", fg="#ffcc00")
+        setter_label.pack(padx=12, pady=(0, 4))
+
+        # ── Set direction radio buttons ──
         tk.Label(dlg, text="Set Direction (required):",
                  font=("Helvetica", 11), bg="#2d2d2d", fg="white"
                  ).pack(padx=12, pady=(8, 2), anchor="w")
@@ -818,6 +867,7 @@ class LabellingTool(tk.Tk):
                            font=("Helvetica", 11)
                            ).pack(padx=24, anchor="w")
 
+        # ── Action buttons ──
         btn_frame = tk.Frame(dlg, bg="#2d2d2d")
         btn_frame.pack(padx=12, pady=12, fill=tk.X)
 
@@ -828,8 +878,13 @@ class LabellingTool(tk.Tk):
                                        "Please select a set direction before saving.",
                                        parent=dlg)
                 return
+            if setter_pos[0] is None:
+                messagebox.showwarning("Setter position required",
+                                       "Please click on the setter in the image above.",
+                                       parent=dlg)
+                return
             dlg.destroy()
-            self._save_clip(cx, cy, cw, ch, direction)
+            self._save_clip(cx, cy, cw, ch, direction, setter_pos[0])
 
         def on_cancel():
             dlg.destroy()
@@ -857,7 +912,7 @@ class LabellingTool(tk.Tk):
 
     # ─── Clip Saving ──────────────────────────────────────────────────────────
 
-    def _save_clip(self, cx, cy, cw, ch, direction):
+    def _save_clip(self, cx, cy, cw, ch, direction, setter_pos=None):
         """Extract the cropped clip and write it as MP4."""
         try:
             clip_dur = float(self.dur_var.get())
@@ -905,6 +960,9 @@ class LabellingTool(tk.Tk):
 
         self._seek_frame(mark_frame)
 
+        setter_x = setter_pos[0] if setter_pos else ""
+        setter_y = setter_pos[1] if setter_pos else ""
+
         with open(self.master_csv_path, "a", newline="") as f:
             csv_writer = csv.writer(f)
             csv_writer.writerow([
@@ -916,6 +974,8 @@ class LabellingTool(tk.Tk):
                 clip_dur,
                 cx, cy, cw, ch,
                 direction,
+                setter_x,
+                setter_y,
                 datetime.now().isoformat(timespec="seconds")
             ])
 
