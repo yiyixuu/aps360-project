@@ -3,12 +3,11 @@ Keypoint Extraction Pipeline
 APS360 Project — Pose Data Preparation
 
 Reads labels.csv produced by labelling_tool.py, runs YOLO pose estimation on
-the FULL video frame (not the crop) for best detection quality, identifies the
-setter using the labelled position, and tracks them via bounding-box IoU.
+the source video, identifies the setter using the labelled position, and
+tracks them via bounding-box IoU.
 
-Keypoints are normalised to [0,1] relative to the crop region so the model
-sees position-invariant setter motion regardless of where the setter appeared
-in the original video.
+Keypoints are normalised to [0,1] relative to the full frame dimensions so
+the model sees resolution-invariant setter motion.
 
 Usage:
     python extract_keypoints.py
@@ -114,21 +113,18 @@ IOU_THRESHOLD = 0.15   # minimum overlap to accept a match
 
 def extract_clip_keypoints(model, video_path,
                            start_frame, end_frame,
-                           crop_x, crop_y, crop_w, crop_h,
                            setter_x, setter_y):
-    """Run YOLO pose on the FULL frame and return the setter's keypoints.
+    """Run YOLO pose on the full frame and return the setter's keypoints.
 
-    YOLO runs on the full-resolution frame (not the crop) so it gets the best
-    possible image quality for detection.  The setter is identified on the
-    first frame using (setter_x, setter_y) converted to full-frame coordinates.
-    On subsequent frames the setter is tracked by bounding-box IoU.
+    The setter is identified on the first frame using (setter_x, setter_y)
+    which are full-frame pixel coordinates.  On subsequent frames the setter
+    is tracked by bounding-box IoU.
 
-    Keypoints are then normalised to [0, 1] relative to the crop region so the
-    output is position-invariant.
+    Keypoints are normalised to [0, 1] relative to the frame dimensions.
 
     Returns:
         np.ndarray of shape (num_frames, 17, 3)  — x,y normalised to [0,1]
-        relative to crop dimensions, confidence preserved.
+        relative to frame dimensions, confidence preserved.
         Returns None on failure.
     """
     cap = cv2.VideoCapture(video_path)
@@ -136,14 +132,14 @@ def extract_clip_keypoints(model, video_path,
         print(f"    ERROR: cannot open video {video_path}")
         return None
 
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     num_frames = end_frame - start_frame + 1
     keypoints = np.zeros((num_frames, 17, 3), dtype=np.float32)
 
-    # Convert setter position from crop coords → full-frame coords
-    target_point = np.array([crop_x + setter_x,
-                             crop_y + setter_y], dtype=np.float32)
+    target_point = np.array([setter_x, setter_y], dtype=np.float32)
     prev_box = None             # [x1, y1, x2, y2] in full-frame coords
     frames_with_detection = 0
 
@@ -153,18 +149,18 @@ def extract_clip_keypoints(model, video_path,
             print(f"    WARNING: failed to read frame {start_frame + offset}")
             break
 
-        # Run YOLO pose on the FULL frame — much better detection quality
+        # Run YOLO pose on the full frame
         results = model(frame, verbose=False)
         result = results[0]
-        kpts_data = result.keypoints.data   # (num_people, 17, 3)  full-frame coords
-        boxes = result.boxes.xyxy.cpu().numpy()  # (num_people, 4)  full-frame coords
+        kpts_data = result.keypoints.data   # (num_people, 17, 3)
+        boxes = result.boxes.xyxy.cpu().numpy()  # (num_people, 4)
 
         if len(kpts_data) == 0:
             continue  # leave zeros for this frame
 
         if prev_box is None:
             # First detection: find person closest to the labelled setter
-            # position (in full-frame coords), lock onto their bounding box.
+            # position, lock onto their bounding box.
             person_idx, _ = find_closest_person(kpts_data, target_point)
             if person_idx is None:
                 continue
@@ -182,9 +178,9 @@ def extract_clip_keypoints(model, video_path,
 
         person_kpts = kpts_data[person_idx].cpu().numpy()   # (17, 3)
 
-        # Shift keypoints to crop-relative coords, then normalise to [0, 1]
-        person_kpts[:, 0] = (person_kpts[:, 0] - crop_x) / crop_w
-        person_kpts[:, 1] = (person_kpts[:, 1] - crop_y) / crop_h
+        # Normalise keypoints to [0, 1] relative to full frame dimensions
+        person_kpts[:, 0] = person_kpts[:, 0] / frame_w
+        person_kpts[:, 1] = person_kpts[:, 1] / frame_h
 
         keypoints[offset] = person_kpts
         frames_with_detection += 1
@@ -245,7 +241,7 @@ def main():
         reader = csv.DictReader(f)
         for row in reader:
             if not row.get("setter_x") or not row.get("setter_y"):
-                print(f"  SKIP {row['clip_id']}: no setter position (old format?)")
+                print(f"  SKIP {row['clip_id']}: no setter position")
                 continue
             clips.append(row)
 
@@ -266,10 +262,6 @@ def main():
         direction   = clip["set_direction"]
         start_frame = int(clip["start_frame"])
         end_frame   = int(clip["end_frame"])
-        crop_x      = int(clip["crop_x"])
-        crop_y      = int(clip["crop_y"])
-        crop_w      = int(clip["crop_w"])
-        crop_h      = int(clip["crop_h"])
         setter_x    = float(clip["setter_x"])
         setter_y    = float(clip["setter_y"])
 
@@ -288,13 +280,11 @@ def main():
         print(f"  [{i+1}/{len(clips)}] {clip_id}  "
               f"{direction:>12s}  "
               f"frames {start_frame}–{end_frame} ({num_frames}f)  "
-              f"crop {crop_w}×{crop_h}  "
               f"setter ({setter_x:.0f}, {setter_y:.0f})")
 
         kp = extract_clip_keypoints(
             model, video_path,
             start_frame, end_frame,
-            crop_x, crop_y, crop_w, crop_h,
             setter_x, setter_y,
         )
 

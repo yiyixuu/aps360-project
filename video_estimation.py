@@ -27,7 +27,7 @@ COCO_KEYPOINT_NAMES = [
 ]
 
 # Video file path
-video_path = '/Users/yiyixu/Documents/School/Third Year/Winter/APS360/project/set_video.mov'
+video_path = '/Users/yiyixu/Documents/School/Third Year/Winter/APS360/project/clips/76f4c1961f.mp4'
 
 # Open the video file
 cap = cv2.VideoCapture(video_path)

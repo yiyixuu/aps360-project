@@ -1,2 +1,7 @@
-clip_id,source_video,mark_frame,start_frame,end_frame,clip_duration_sec,crop_x,crop_y,crop_w,crop_h,set_direction,setter_x,setter_y,timestamp
-95722a9b1f,Long Beach VS Pepperdine Men’s Volleyball Exhibition Match-854x480-avc1-mp4a.mp4,24176,24147,24176,1.0,398,103,118,205,Right Side,97,110,2026-03-11T13:33:55
+clip_id,source_video,mark_frame,start_frame,end_frame,clip_duration_sec,set_direction,setter_x,setter_y,timestamp
+96c9be1923,canada vs italy.mp4,533,475,533,1.0,Middle,1136,677,2026-03-12T10:23:51
+9951725c37,canada vs italy.mp4,2604,2546,2604,1.0,Middle,1168,691,2026-03-12T10:26:22
+899df7e87f,canada vs italy.mp4,6586,6528,6586,1.0,Right Side,1358,730,2026-03-12T10:34:53
+60965ef963,canada vs italy.mp4,10429,10371,10429,1.0,Pipe,1289,702,2026-03-12T10:37:02
+7f7323a0fc,canada vs italy.mp4,19335,19277,19335,1.0,Pipe,1336,708,2026-03-12T10:44:33
+11b1b8eb1d,canada vs italy.mp4,21243,21185,21243,1.0,Left Side,1410,710,2026-03-12T10:45:49

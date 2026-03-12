@@ -2,9 +2,9 @@
 Keypoint Visualization
 APS360 Project — Visual QA for extracted pose data
 
-Plays each labelled clip (cropped, looping) with the extracted keypoints and
-skeleton drawn on top, so you can verify the pose estimation tracked the
-setter correctly.
+Plays each labelled clip (looping) with the extracted keypoints and skeleton
+drawn on top, so you can verify the pose estimation tracked the setter
+correctly.
 
 Usage:
     python visualize_keypoints.py
@@ -65,20 +65,20 @@ CONF_THRESHOLD = 0.3             # don't draw low-confidence points
 
 # ─── Drawing helpers ─────────────────────────────────────────────────────────
 
-def draw_skeleton(frame, kpts, crop_w, crop_h):
+def draw_skeleton(frame, kpts, frame_w, frame_h):
     """Draw COCO skeleton and keypoints on a frame.
 
     Args:
-        frame  : BGR image (will be modified in-place)
-        kpts   : (17, 3) array — normalised x, y, confidence
-        crop_w : original crop width  (for denormalisation)
-        crop_h : original crop height (for denormalisation)
+        frame   : BGR image (will be modified in-place)
+        kpts    : (17, 3) array — normalised x, y, confidence
+        frame_w : video frame width  (for denormalisation)
+        frame_h : video frame height (for denormalisation)
     """
     # Denormalise to pixel coordinates
     points = []
     for kx, ky, conf in kpts:
-        px = int(kx * crop_w)
-        py = int(ky * crop_h)
+        px = int(kx * frame_w)
+        py = int(ky * frame_h)
         points.append((px, py, conf))
 
     # Draw limbs
@@ -100,19 +100,20 @@ def draw_skeleton(frame, kpts, crop_w, crop_h):
 
 # ─── Load clip frames from source video ──────────────────────────────────────
 
-def load_clip_frames(video_path, start_frame, end_frame,
-                     crop_x, crop_y, crop_w, crop_h):
-    """Read and crop frames for a clip from the source video.
+def load_clip_frames(video_path, start_frame, end_frame):
+    """Read full frames for a clip from the source video.
 
     Returns:
-        list of BGR numpy frames, or None on failure.
+        (list of BGR numpy frames, fps, frame_w, frame_h)  or  (None, 0, 0, 0)
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"  ERROR: cannot open video {video_path}")
-        return None, 0
+        return None, 0, 0, 0
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     frames = []
@@ -120,11 +121,10 @@ def load_clip_frames(video_path, start_frame, end_frame,
         ret, frame = cap.read()
         if not ret:
             break
-        cropped = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-        frames.append(cropped)
+        frames.append(frame)
 
     cap.release()
-    return frames, fps
+    return frames, fps, frame_w, frame_h
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ def main():
     print(f"Loaded {n_clips} clips from {dataset_path}")
     print(f"Classes: {list(label_names)}\n")
 
-    # ── Load labels CSV for video/crop metadata ──
+    # ── Load labels CSV for video metadata ──
     csv_rows = {}
     with open(labels_path, "r") as f:
         reader = csv.DictReader(f)
@@ -196,10 +196,6 @@ def main():
         source      = row["source_video"]
         start_frame = int(row["start_frame"])
         end_frame   = int(row["end_frame"])
-        crop_x      = int(row["crop_x"])
-        crop_y      = int(row["crop_y"])
-        crop_w      = int(row["crop_w"])
-        crop_h      = int(row["crop_h"])
 
         # Find video
         video_path = os.path.join(videos_dir, source)
@@ -210,25 +206,24 @@ def main():
             clip_idx = (clip_idx + 1) % n_clips
             continue
 
-        print(f"  Clip {clip_idx}/{n_clips - 1}:  {cid}  |  {direction}  |  "
-              f"frames {start_frame}–{end_frame}  |  crop {crop_w}×{crop_h}")
-
-        frames, fps = load_clip_frames(
-            video_path, start_frame, end_frame,
-            crop_x, crop_y, crop_w, crop_h)
+        frames, fps, frame_w, frame_h = load_clip_frames(
+            video_path, start_frame, end_frame)
 
         if not frames:
             print("    No frames loaded, skipping.")
             clip_idx = (clip_idx + 1) % n_clips
             continue
 
-        # Scale up small crops for better visibility
-        min_display = 400
+        print(f"  Clip {clip_idx}/{n_clips - 1}:  {cid}  |  {direction}  |  "
+              f"frames {start_frame}–{end_frame}  |  {frame_w}×{frame_h}")
+
+        # Scale down large frames for display
+        max_display = 900
         scale = 1.0
-        if crop_w < min_display and crop_h < min_display:
-            scale = min_display / min(crop_w, crop_h)
-        disp_w = int(crop_w * scale)
-        disp_h = int(crop_h * scale)
+        if frame_w > max_display or frame_h > max_display:
+            scale = max_display / max(frame_w, frame_h)
+        disp_w = int(frame_w * scale)
+        disp_h = int(frame_h * scale)
 
         delay = max(1, int(1000 / fps))
         frame_i = 0
@@ -241,9 +236,9 @@ def main():
 
             # Draw keypoints if we have them for this frame
             if f_idx < len(kp):
-                draw_skeleton(display, kp[f_idx], crop_w, crop_h)
+                draw_skeleton(display, kp[f_idx], frame_w, frame_h)
 
-            # Scale up for display
+            # Scale for display
             if scale != 1.0:
                 display = cv2.resize(display, (disp_w, disp_h),
                                      interpolation=cv2.INTER_LINEAR)

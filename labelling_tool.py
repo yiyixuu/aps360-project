@@ -12,8 +12,8 @@ Controls:
     Shift+Left  — Jump 1 second back
     Shift+Right — Jump 1 second forward
     M           — Mark current frame as set point
-    Enter       — Confirm crop during preview
-    Esc         — Cancel current operation (mark / crop / preview)
+    Enter       — Confirm clip during preview
+    Esc         — Cancel current operation
     Ctrl+Q      — Quit
 """
 
@@ -71,24 +71,20 @@ class LabellingTool(tk.Tk):
         self._img_y = 0
         self._canvas_image_id = None    # persistent canvas image item
 
-        # ── Marker / crop state ──
+        # ── Marker state ──
         self.markers = []               # list of saved clip info
-        self.crop_mode = False
-        self.crop_start = None          # (x, y) in display coords
-        self.crop_rect_id = None        # canvas rectangle id
         self.pending_marker_frame = None
         self.clip_duration = DEFAULT_CLIP_DURATION
 
         # ── Preview playback state ──
         self.previewing = False
         self.preview_after_id = None
-        self.preview_crop = None        # (cx, cy, cw, ch) in original coords
-        self.preview_display_rect = None  # (rx0, ry0, rx1, ry1) in display coords
         self._preview_frames = []       # pre-loaded frames for looping preview
         self._preview_idx = 0
+        self._preview_start_time = None
 
-        # ── Clip output ──
-        self.clips_dir = None
+        # ── Label output ──
+        self.labels_dir = None
         self.master_csv_path = None
 
         # ── Build UI ──
@@ -131,11 +127,6 @@ class LabellingTool(tk.Tk):
         self.canvas = tk.Canvas(left_frame, bg="#000000", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 0))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-
-        # Crop interactions
-        self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
-        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
         # Timeline
         timeline_frame = tk.Frame(left_frame, bg="#1e1e1e")
@@ -211,7 +202,7 @@ class LabellingTool(tk.Tk):
         self.mark_btn.pack(padx=12, pady=(0, 4))
 
         # Confirm button (shown during preview)
-        self.confirm_btn = tk.Button(right_frame, text="✓  Confirm Crop (Enter)",
+        self.confirm_btn = tk.Button(right_frame, text="✓  Confirm (Enter)",
                                      width=20, command=self._confirm_preview,
                                      font=label_font, bg="#27ae60", fg="white",
                                      activebackground="#2ecc71")
@@ -232,7 +223,7 @@ class LabellingTool(tk.Tk):
         ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
 
         # ── Markers list ──
-        tk.Label(right_frame, text="Saved Clips", font=header_font,
+        tk.Label(right_frame, text="Saved Labels", font=header_font,
                  bg="#2d2d2d", fg="white").pack(**pad, anchor="w")
 
         self.marker_listbox = tk.Listbox(right_frame, bg="#1e1e1e", fg="white",
@@ -283,16 +274,17 @@ class LabellingTool(tk.Tk):
 
         self.video_path = path
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        raw_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        self.fps = raw_fps if 1.0 <= raw_fps <= 240.0 else 30.0
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.current_frame_idx = 0
 
         # Set up output directory in the same folder as this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.clips_dir = os.path.join(script_dir, "clips")
-        os.makedirs(self.clips_dir, exist_ok=True)
-        self.master_csv_path = os.path.join(self.clips_dir, "labels.csv")
+        self.labels_dir = os.path.join(script_dir, "clips")
+        os.makedirs(self.labels_dir, exist_ok=True)
+        self.master_csv_path = os.path.join(self.labels_dir, "labels.csv")
 
         # Initialise CSV if it doesn't exist
         if not os.path.exists(self.master_csv_path):
@@ -300,7 +292,6 @@ class LabellingTool(tk.Tk):
                 writer = csv.writer(f)
                 writer.writerow(["clip_id", "source_video", "mark_frame",
                                  "start_frame", "end_frame", "clip_duration_sec",
-                                 "crop_x", "crop_y", "crop_w", "crop_h",
                                  "set_direction", "setter_x", "setter_y",
                                  "timestamp"])
 
@@ -354,7 +345,7 @@ class LabellingTool(tk.Tk):
             self._display_frame(frame)
             self._update_timeline()
 
-    def _display_frame(self, frame, crop_overlay=None):
+    def _display_frame(self, frame):
         """Render an OpenCV BGR frame onto the tkinter canvas."""
         if self._display_w < 1 or self._display_h < 1:
             self._recompute_display_size()
@@ -375,29 +366,15 @@ class LabellingTool(tk.Tk):
         # Remove old overlays
         self.canvas.delete("overlay")
 
-        # Draw crop rectangle overlay during preview
-        if crop_overlay:
-            rx0, ry0, rx1, ry1 = crop_overlay
-            self.canvas.create_rectangle(
-                rx0, ry0, rx1, ry1,
-                outline="#ffcc00", width=2, dash=(6, 3), tags="overlay")
-
-        # If in crop mode, show instruction overlay
-        cw = self.canvas.winfo_width()
-        if self.crop_mode and not self.previewing:
-            self.canvas.create_text(cw // 2, 25,
-                                    text="Draw a rectangle around the setter, then release",
-                                    fill="#ffcc00", font=("Helvetica", 14, "bold"),
-                                    tags="overlay")
-
         # If previewing, show preview label
         if self.previewing:
+            cw = self.canvas.winfo_width()
             self.canvas.create_text(cw // 2, 25,
                                     text="Previewing clip (looping) — Enter to confirm, Esc to cancel",
                                     fill="#00ccff", font=("Helvetica", 14, "bold"),
                                     tags="overlay")
 
-    def _display_frame_fast(self, photo, crop_overlay=None):
+    def _display_frame_fast(self, photo):
         """Display a pre-converted PhotoImage (fastest path for playback)."""
         self._photo = photo
         if self._canvas_image_id is not None:
@@ -408,11 +385,6 @@ class LabellingTool(tk.Tk):
                 self._img_x, self._img_y, anchor=tk.NW, image=self._photo)
 
         self.canvas.delete("overlay")
-        if crop_overlay:
-            rx0, ry0, rx1, ry1 = crop_overlay
-            self.canvas.create_rectangle(
-                rx0, ry0, rx1, ry1,
-                outline="#ffcc00", width=2, dash=(6, 3), tags="overlay")
 
     def _on_canvas_resize(self, event):
         self._canvas_image_id = None  # invalidate cached canvas item
@@ -486,7 +458,7 @@ class LabellingTool(tk.Tk):
     def _toggle_play(self):
         if self.cap is None:
             return
-        if self.crop_mode or self.previewing:
+        if self.previewing:
             return
         self.playing = not self.playing
         self.play_btn.config(text="⏸  Pause" if self.playing else "▶  Play")
@@ -507,6 +479,16 @@ class LabellingTool(tk.Tk):
             # No frame ready yet, try again soon
             self.after_id = self.after(2, self._play_loop)
             return
+
+        # Keep real-time playback for high-FPS videos by skipping stale frames
+        # when UI rendering is slower than decode speed.
+        elapsed = time.perf_counter() - self._play_start_time
+        expected_idx = self._play_start_frame + int(elapsed * self.fps * self.play_speed)
+        while idx < expected_idx:
+            try:
+                idx, frame = self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
 
         if idx >= self.total_frames:
             self._pause()
@@ -529,13 +511,13 @@ class LabellingTool(tk.Tk):
         self.after_id = self.after(delay_ms, self._play_loop)
 
     def _step_frame(self, delta):
-        if self.cap is None or self.crop_mode or self.previewing:
+        if self.cap is None or self.previewing:
             return
         self._pause()
         self._seek_frame(self.current_frame_idx + delta)
 
     def _jump_seconds(self, sec):
-        if self.cap is None or self.crop_mode or self.previewing:
+        if self.cap is None or self.previewing:
             return
         self._pause()
         delta_frames = int(sec * self.fps)
@@ -564,104 +546,37 @@ class LabellingTool(tk.Tk):
         except ValueError:
             self.play_speed = 1.0
 
-    # ─── Cancel All ───────────────────────────────────────────────────────────
+    # ─── Cancel ───────────────────────────────────────────────────────────────
 
     def _cancel_all(self):
-        """Cancel any active operation: preview, crop, or mark."""
+        """Cancel any active operation."""
         if self.previewing:
             self._cancel_preview()
-        elif self.crop_mode:
-            self._cancel_crop()
 
     def _set_cancel_enabled(self, enabled):
         self.cancel_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
 
-    # ─── Marking & Cropping ───────────────────────────────────────────────────
+    # ─── Marking ──────────────────────────────────────────────────────────────
 
     def _mark_set(self):
         if self.cap is None:
             messagebox.showinfo("No video", "Please open a video first.")
             return
-        if self.crop_mode or self.previewing:
+        if self.previewing:
             return
 
         self._pause()
         self.pending_marker_frame = self.current_frame_idx
-        self.crop_mode = True
-        self.crop_start = None
-        self.crop_rect_id = None
-        self.canvas.config(cursor="crosshair")
         self._set_cancel_enabled(True)
         self._update_status(
             f"Marked frame {self.current_frame_idx}.\n"
-            "Now draw a crop rectangle around the setter.")
-        if self.current_frame is not None:
-            self._display_frame(self.current_frame)
-
-    def _cancel_crop(self):
-        """Cancel crop mode and return to normal navigation."""
-        self.crop_mode = False
-        self.crop_start = None
-        self.pending_marker_frame = None
-        self.canvas.config(cursor="")
-        self._set_cancel_enabled(False)
-        self.confirm_btn.pack_forget()
-        if self.crop_rect_id:
-            self.canvas.delete(self.crop_rect_id)
-            self.crop_rect_id = None
-        self._update_status("Cancelled.")
-        if self.current_frame is not None:
-            self._display_frame(self.current_frame)
-
-    def _on_canvas_press(self, event):
-        if not self.crop_mode or self.previewing:
-            return
-        self.crop_start = (event.x, event.y)
-
-    def _on_canvas_drag(self, event):
-        if not self.crop_mode or self.crop_start is None or self.previewing:
-            return
-        if self.crop_rect_id:
-            self.canvas.delete(self.crop_rect_id)
-        x0, y0 = self.crop_start
-        self.crop_rect_id = self.canvas.create_rectangle(
-            x0, y0, event.x, event.y,
-            outline="#ffcc00", width=2, dash=(6, 3))
-
-    def _on_canvas_release(self, event):
-        if not self.crop_mode or self.crop_start is None or self.previewing:
-            return
-
-        x0, y0 = self.crop_start
-        x1, y1 = event.x, event.y
-
-        if abs(x1 - x0) < 10 or abs(y1 - y0) < 10:
-            return
-
-        rx0, ry0 = min(x0, x1), min(y0, y1)
-        rx1, ry1 = max(x0, x1), max(y0, y1)
-
-        img_x = self._img_x
-        img_y = self._img_y
-        scale = self.display_scale
-
-        crop_x = max(0, int((rx0 - img_x) / scale))
-        crop_y = max(0, int((ry0 - img_y) / scale))
-        crop_w = min(self.frame_width - crop_x, int((rx1 - rx0) / scale))
-        crop_h = min(self.frame_height - crop_y, int((ry1 - ry0) / scale))
-
-        if crop_w < 5 or crop_h < 5:
-            self._update_status("Crop region too small. Try again.")
-            return
-
-        self.preview_crop = (crop_x, crop_y, crop_w, crop_h)
-        self.preview_display_rect = (rx0, ry0, rx1, ry1)
+            "Previewing clip…")
         self._start_preview()
 
     # ─── Preview Playback (looping) ───────────────────────────────────────────
 
     def _start_preview(self):
-        """Pre-load all clip frames, then loop them with the crop overlay."""
+        """Pre-load all clip frames, then loop them."""
         try:
             clip_dur = float(self.dur_var.get())
             if clip_dur <= 0:
@@ -692,7 +607,7 @@ class LabellingTool(tk.Tk):
 
         self.previewing = True
         self._preview_idx = 0
-        self.canvas.config(cursor="")
+        self._preview_start_time = time.perf_counter()
 
         # Show confirm button
         self.confirm_btn.pack(padx=12, pady=(0, 4))
@@ -700,19 +615,21 @@ class LabellingTool(tk.Tk):
         self._update_status(
             f"Previewing {clip_dur}s clip (looping).\n"
             "Press Enter or click Confirm when satisfied.\n"
-            "Press Esc to cancel and redraw.")
+            "Press Esc to cancel.")
 
         self._preview_loop()
 
     def _preview_loop(self):
-        """Play pre-loaded frames in a loop with the crop overlay."""
+        """Play pre-loaded frames in a loop."""
         if not self.previewing or not self._preview_frames:
             return
 
+        elapsed = time.perf_counter() - self._preview_start_time
+        self._preview_idx = int(elapsed * self.fps) % len(self._preview_frames)
         idx, frame, photo = self._preview_frames[self._preview_idx]
         self.current_frame_idx = idx
         self.current_frame = frame
-        self._display_frame_fast(photo, crop_overlay=self.preview_display_rect)
+        self._display_frame_fast(photo)
         self._update_timeline()
 
         # Show looping overlay text
@@ -723,15 +640,11 @@ class LabellingTool(tk.Tk):
                                 fill="#00ccff", font=("Helvetica", 14, "bold"),
                                 tags="overlay_text")
 
-        self._preview_idx += 1
-        if self._preview_idx >= len(self._preview_frames):
-            self._preview_idx = 0  # loop back to start
-
         delay = max(1, int(1000 / self.fps))
         self.preview_after_id = self.after(delay, self._preview_loop)
 
     def _confirm_preview(self):
-        """User confirmed the crop — show the label dialog."""
+        """User confirmed the clip — show the label dialog."""
         if not self.previewing:
             return
 
@@ -743,55 +656,58 @@ class LabellingTool(tk.Tk):
 
         self.confirm_btn.pack_forget()
 
-        # Grab first frame (for setter position marking) and last frame
+        # Grab first frame (for setter position marking)
         first_frame = None
         if self._preview_frames:
             _first_idx, first_frame, _first_photo = self._preview_frames[0]
             last_idx, last_frame, last_photo = self._preview_frames[-1]
             self.current_frame_idx = last_idx
             self.current_frame = last_frame
-            self._display_frame_fast(last_photo, crop_overlay=self.preview_display_rect)
+            self._display_frame_fast(last_photo)
 
         self._preview_frames = []  # free memory
+        self._preview_start_time = None
 
-        cx, cy, cw, ch = self.preview_crop
-        self._show_crop_confirm(cx, cy, cw, ch, first_frame)
+        if first_frame is not None:
+            self._show_label_dialog(first_frame)
+        else:
+            self._cancel_mark()
 
     def _cancel_preview(self):
-        """Cancel the preview playback and return to crop mode."""
+        """Cancel the preview and return to normal navigation."""
         self.previewing = False
         if self.preview_after_id is not None:
             self.after_cancel(self.preview_after_id)
             self.preview_after_id = None
-        self.preview_crop = None
-        self.preview_display_rect = None
         self._preview_frames = []
+        self._preview_start_time = None
         self.confirm_btn.pack_forget()
+        self.pending_marker_frame = None
+        self._set_cancel_enabled(False)
 
-        if self.pending_marker_frame is not None:
-            self._seek_frame(self.pending_marker_frame)
-        self.crop_mode = True
-        self.crop_start = None
-        self.crop_rect_id = None
-        self.canvas.config(cursor="crosshair")
-        self._update_status(
-            "Preview cancelled. Draw a new crop rectangle, or press Esc to cancel the mark.")
+        if self.current_frame is not None:
+            self._seek_frame(self.current_frame_idx)
+        self._update_status("Cancelled. Navigate and press M to mark a set.")
+
+    def _cancel_mark(self):
+        """Cancel the current mark and return to normal navigation."""
+        self.pending_marker_frame = None
+        self._set_cancel_enabled(False)
+        self.confirm_btn.pack_forget()
+        self._update_status("Cancelled.")
         if self.current_frame is not None:
             self._display_frame(self.current_frame)
 
-    # ─── Crop Confirmation Dialog ─────────────────────────────────────────────
+    # ─── Label Dialog ─────────────────────────────────────────────────────────
 
-    def _show_crop_confirm(self, cx, cy, cw, ch, first_frame=None):
-        """Show a dialog asking for set direction + setter position on first frame."""
-        # Use first frame for the setter-position click target
-        source_frame = first_frame if first_frame is not None else self.current_frame
-        preview_frame = source_frame[cy:cy+ch, cx:cx+cw]
-        preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+    def _show_label_dialog(self, first_frame):
+        """Show a dialog asking for setter position (click) + set direction."""
+        preview_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
 
-        max_preview = 400
-        ph, pw = preview_rgb.shape[:2]
-        pscale = min(max_preview / pw, max_preview / ph, 1.0)
-        disp_w, disp_h = int(pw * pscale), int(ph * pscale)
+        max_preview = 700
+        fh, fw = preview_rgb.shape[:2]
+        pscale = min(max_preview / fw, max_preview / fh, 1.0)
+        disp_w, disp_h = int(fw * pscale), int(fh * pscale)
         preview_resized = cv2.resize(preview_rgb, (disp_w, disp_h))
 
         dlg = tk.Toplevel(self)
@@ -816,7 +732,7 @@ class LabellingTool(tk.Tk):
         img_canvas.create_image(0, 0, anchor=tk.NW, image=photo)
         img_canvas.image = photo  # prevent GC
 
-        setter_pos = [None]     # mutable; will hold (crop_x, crop_y)
+        setter_pos = [None]     # mutable; will hold (frame_x, frame_y)
         marker_ids = []         # canvas item ids for the crosshair
 
         def on_canvas_click(event):
@@ -840,12 +756,12 @@ class LabellingTool(tk.Tk):
             marker_ids.append(img_canvas.create_line(
                 x, y - r - 4, x, y + r + 4, fill="#ff3333", width=2))
 
-            # Convert display coords → crop coords (original pixel space)
-            crop_rel_x = int(round(x / pscale))
-            crop_rel_y = int(round(y / pscale))
-            setter_pos[0] = (crop_rel_x, crop_rel_y)
+            # Convert display coords → full-frame pixel coords
+            frame_x = int(round(x / pscale))
+            frame_y = int(round(y / pscale))
+            setter_pos[0] = (frame_x, frame_y)
             setter_label.config(
-                text=f"Setter marked at ({crop_rel_x}, {crop_rel_y}) in crop",
+                text=f"Setter marked at ({frame_x}, {frame_y})",
                 fg="#33ff66")
 
         img_canvas.bind("<Button-1>", on_canvas_click)
@@ -884,21 +800,16 @@ class LabellingTool(tk.Tk):
                                        parent=dlg)
                 return
             dlg.destroy()
-            self._save_clip(cx, cy, cw, ch, direction, setter_pos[0])
+            self._save_label(direction,
+                             setter_pos[0][0], setter_pos[0][1])
 
         def on_cancel():
             dlg.destroy()
-            self._cancel_crop()
+            self._cancel_mark()
 
-        def on_redo():
-            dlg.destroy()
-            self._cancel_preview()
-
-        tk.Button(btn_frame, text="Save Clip", command=on_save,
+        tk.Button(btn_frame, text="Save", command=on_save,
                   bg="#27ae60", fg="white", font=("Helvetica", 11, "bold"),
                   width=10).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(btn_frame, text="Redo Crop", command=on_redo,
-                  font=("Helvetica", 11), width=10).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(btn_frame, text="Cancel", command=on_cancel,
                   font=("Helvetica", 11), width=10).pack(side=tk.LEFT)
 
@@ -910,10 +821,10 @@ class LabellingTool(tk.Tk):
         pw2, ph2 = self.winfo_width(), self.winfo_height()
         dlg.geometry(f"+{px + (pw2 - dw) // 2}+{py + (ph2 - dh) // 2}")
 
-    # ─── Clip Saving ──────────────────────────────────────────────────────────
+    # ─── Label Saving ─────────────────────────────────────────────────────────
 
-    def _save_clip(self, cx, cy, cw, ch, direction, setter_pos=None):
-        """Extract the cropped clip and write it as MP4."""
+    def _save_label(self, direction, setter_x, setter_y):
+        """Append a row to the labels CSV (no clip video is saved)."""
         try:
             clip_dur = float(self.dur_var.get())
             if clip_dur <= 0:
@@ -928,40 +839,6 @@ class LabellingTool(tk.Tk):
         end_frame = mark_frame
 
         clip_id = uuid.uuid4().hex[:10]
-        filename = f"{clip_id}.mp4"
-        out_path = os.path.join(self.clips_dir, filename)
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, self.fps, (cw, ch))
-
-        if not writer.isOpened():
-            messagebox.showerror("Error",
-                                 f"Failed to create video writer.\n"
-                                 f"Path: {out_path}\n"
-                                 f"Size: {cw}x{ch}")
-            self._cancel_crop()
-            return
-
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frames_written = 0
-        for i in range(start_frame, end_frame + 1):
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            cropped = frame[cy:cy+ch, cx:cx+cw]
-            writer.write(cropped)
-            frames_written += 1
-        writer.release()
-
-        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            messagebox.showerror("Error", f"Clip file was not saved properly:\n{out_path}")
-            self._cancel_crop()
-            return
-
-        self._seek_frame(mark_frame)
-
-        setter_x = setter_pos[0] if setter_pos else ""
-        setter_y = setter_pos[1] if setter_pos else ""
 
         with open(self.master_csv_path, "a", newline="") as f:
             csv_writer = csv.writer(f)
@@ -972,25 +849,15 @@ class LabellingTool(tk.Tk):
                 start_frame,
                 end_frame,
                 clip_dur,
-                cx, cy, cw, ch,
                 direction,
                 setter_x,
                 setter_y,
                 datetime.now().isoformat(timespec="seconds")
             ])
 
-        # Finish crop mode
-        self.crop_mode = False
-        self.crop_start = None
+        # Reset state
         self.pending_marker_frame = None
-        self.preview_crop = None
-        self.preview_display_rect = None
-        self.canvas.config(cursor="")
         self._set_cancel_enabled(False)
-        self.confirm_btn.pack_forget()
-        if self.crop_rect_id:
-            self.canvas.delete(self.crop_rect_id)
-            self.crop_rect_id = None
 
         self.markers.append((mark_frame, clip_id, direction))
         frame_time = self._fmt_time(mark_frame / self.fps)
@@ -999,12 +866,11 @@ class LabellingTool(tk.Tk):
             f"{clip_id}  |  {frame_time}  |  {direction}")
 
         self._update_status(
-            f"Saved: {filename} ({direction})\n"
-            f"{frames_written} frames, {cw}x{ch}\n"
-            f"→ {self.clips_dir}")
+            f"Saved: {clip_id} ({direction})\n"
+            f"frames {start_frame}–{end_frame}\n"
+            f"setter at ({setter_x}, {setter_y})")
 
-        if self.current_frame is not None:
-            self._display_frame(self.current_frame)
+        self._seek_frame(mark_frame)
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1016,7 +882,7 @@ class LabellingTool(tk.Tk):
     def _quit(self):
         if self.markers:
             if not messagebox.askyesno("Quit",
-                                       f"{len(self.markers)} clips saved this session.\n"
+                                       f"{len(self.markers)} labels saved this session.\n"
                                        "Are you sure you want to quit?"):
                 return
         self.destroy()
