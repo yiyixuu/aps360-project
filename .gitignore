@@ -21,4 +21,10 @@ clips/*.mp4
 __pycache__/
 *.pyc
 
-dataset_full.csv
+# ─── Course documents / reference files ──
+*.pdf
+*.xlsx
+
+# ─── Old exploration files ──
+pose_estimation.ipynb
+set.jpg
