@@ -1,0 +1,182 @@
+\documentclass[final]{article}
+
+
+\usepackage{APS360}
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{graphicx}
+
+\title{Predicting Volleyball Rally Outcome from Annotated Game Events Using LSTM}
+
+\author{%
+  Yiyi Xu \\
+  1009851402, yiyi.xu@mail.utoronto.ca\\
+  \underline{\href{https://github.com/yiyixuu/aps360-project}{Link to GitHub Repository}}\\
+}
+
+\begin{document}
+
+\maketitle
+
+\vspace{-0.5in}
+
+\section*{Introduction}
+
+Volleyball is a fast-paced sport in which the outcome of each rally depends on a complex sequence of tactical decisions: serve placement, reception quality, set selection, attack type, and blocking response. Predicting which team wins a rally from this sequence of actions is valuable for coaching staff seeking data-driven tactical insights, such as identifying which offensive patterns lead to the highest kill rates or which defensive formations are most vulnerable. Because rallies are inherently sequential---earlier actions constrain later options---a machine learning approach that models temporal dependencies is well suited to this task. In particular, recurrent architectures such as Long Short-Term Memory (LSTM) networks~\cite{lstm} are designed to capture exactly this kind of ordered, variable-length structure, making them a natural fit for rally-level prediction.
+
+This project formulates rally outcome prediction as binary classification (team~\texttt{a} vs.\ team~\texttt{b} wins) using the VREN (Volleyball Rally dataset with Expression Notation) dataset~\cite{vren}. A baseline feedforward network is first trained on one-hot encoded features to establish a lower bound. The primary model is a two-layer LSTM with learned embeddings and data augmentation that processes each rally as a sequence of rounds. The LSTM is then evaluated on a held-out test set and on 30 externally hand-annotated rallies to assess generalization. Figure~\ref{fig:pipeline} illustrates the full pipeline.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figures/pipeline.png}
+    \caption{Overview of the rally outcome prediction pipeline, from raw VREN data through preprocessing, model training, and evaluation.}
+    \label{fig:pipeline}
+\end{figure}
+
+\section*{Background and Related Work}
+
+Xia et al.~\cite{vren} introduced the VREN dataset and notation language for describing indoor volleyball rally processes. They proposed three analytical tasks---rally prediction, set-type prediction, and hit-type prediction---and trained simple neural baselines on the structured features. Tracy et al.~\cite{gnn} extended this work using graph neural networks with a specialized graph encoding that adds contact-by-contact context, achieving improved results on rally outcome and play-type prediction. Ntzoufras et al.~\cite{bayesian} developed Bayesian models (ordered multinomial logistic regression and truncated Skellam distributions) for predicting set-difference outcomes in professional volleyball, demonstrating that sport-specific statistical models can capture match dynamics. Chen et al.~\cite{mlvolley} applied Ridge Regression, Random Forest, Gradient Boosting, and LSTM models to predict volleyball match outcomes in the Taiwan Volleyball League, finding that ensemble methods with LASSO-based feature selection performed competitively with sequential models. Finally, the original LSTM architecture by Hochreiter and Schmidhuber~\cite{lstm} introduced gated memory cells for learning long-range dependencies, forming the foundation for the recurrent model used in this project.
+
+\section*{Data Processing}
+
+The VREN dataset (\texttt{dataset\_full.csv}) contains 2{,}429~rows and 18~columns spanning 9~professional and NCAA Division~I games. Each row records one round of a rally, including features such as \texttt{serve\_type}, court-zone locations (\texttt{receive\_location}, \texttt{hitter\_location}, etc.), \texttt{pass\_rating}, \texttt{set\_type}, \texttt{hit\_type}, \texttt{num\_blockers}, and \texttt{block\_touch}. The columns \texttt{win\_reason} and \texttt{lose\_reason} were dropped to prevent target leakage, and the target \texttt{winning\_team} was encoded as binary ($\texttt{a}\!\mapsto\!0$, $\texttt{b}\!\mapsto\!1$).
+
+After assigning a unique rally identifier by detecting game boundaries (where the \texttt{rally} column resets), the dataset contains 1{,}500~unique rallies with lengths ranging from 1 to 9~rounds (mean~1.6, median~1). Single-round rallies (aces or serve errors) account for 67.2\% of all rallies. The overall winner distribution is 809~team~A vs.\ 691~team~B.
+
+For the LSTM, each of the 13~categorical features is mapped to a learned embedding (dimension 2--5 depending on vocabulary size; index~0 reserved for missing values), yielding a 46-dimensional categorical vector per timestep. The \texttt{round} number is normalized and appended as a single continuous feature, giving a total input dimension of~47. Rallies are grouped by \texttt{unique\_rally} and ordered by \texttt{round}; variable-length sequences are handled with packed sequences so that padding does not affect hidden-state updates. The data is split at the rally level using stratified sampling into 1{,}049~training, 226~validation, and 225~test rallies (70/15/15). To address data scarcity, a team-swap augmentation doubles the effective training set to 2{,}098 by swapping team~A and team~B labels along with all position-specific features.
+
+\section*{Architecture}
+
+The primary model is a two-layer LSTM with learned per-feature embeddings:
+\[
+    (x_1,\dots,x_T) \;\to\; \mathrm{Emb}(47) \;\to\; \mathrm{LSTM}(47,32,\text{layers}{=}2,\text{drop}{=}0.5) \;\to\; h_T
+\]
+\[
+    h_T \;\to\; \mathrm{Drop}(0.5) \;\to\; \mathrm{FC}(32,32) \;\to\; \mathrm{ReLU} \;\to\; \mathrm{Drop}(0.5) \;\to\; \mathrm{FC}(32,1)
+\]
+The final hidden state~$h_T$ summarizes the entire rally and is passed through a two-layer classification head. The model has approximately 20{,}700~parameters. Training uses BCEWithLogitsLoss, Adam (lr\,=\,$10^{-3}$, weight decay\,=\,$10^{-4}$), a ReduceLROnPlateau scheduler (patience~5, factor~0.5), and gradient clipping (max norm~1.0). Early stopping on validation ROC-AUC with patience~12 selected the best checkpoint at epoch~47 (out of 60 maximum).
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.75\linewidth]{figures/lstm_architecture.png}
+    \caption{LSTM architecture for rally outcome prediction. Each round's feature vector $x_t$ is fed sequentially into the LSTM. The final hidden state $h_T$ is passed through a classification head to predict the winning team.}
+    \label{fig:lstm_arch}
+\end{figure}
+
+\section*{Baseline Model}
+
+The baseline is a three-layer feedforward network (MLP) that treats each row of the dataset as an independent sample. All 15~input features are one-hot encoded into a 379-dimensional vector, and the architecture is:
+\[
+    \mathrm{FC}(379,128) \to \mathrm{ReLU} \to \mathrm{Drop}(0.3) \to \mathrm{FC}(128,64) \to \mathrm{ReLU} \to \mathrm{Drop}(0.3) \to \mathrm{FC}(64,1)
+\]
+The model has approximately 56{,}000~parameters and was trained for 30~epochs with BCEWithLogitsLoss and Adam (lr\,=\,$10^{-3}$), batch size~64, selecting the checkpoint with the best validation AUC (epoch~10). Because the MLP treats rows independently, it cannot capture how earlier rounds influence later ones within the same rally; this is the key limitation the LSTM addresses.
+
+\section*{Quantitative Results}
+
+Table~\ref{tab:results} compares all models on the held-out test set (225~rallies).
+
+\begin{table}[h]
+    \centering
+    \caption{Test-set performance across models. The LSTM v2 (primary model) substantially outperforms both the MLP baseline and the initial LSTM v1 while using fewer parameters.}
+    \label{tab:results}
+    \begin{tabular}{lcccc}
+        \toprule
+        \textbf{Model} & \textbf{Test Acc} & \textbf{Test AUC} & \textbf{Val AUC} & \textbf{Params} \\
+        \midrule
+        MLP baseline     & 0.699 & 0.751 & 0.718 & ${\sim}$56K \\
+        LSTM v1          & 0.747 & 0.756 & 0.801 & ${\sim}$65K \\
+        \textbf{LSTM v2} & \textbf{0.907} & \textbf{0.953} & \textbf{0.947} & ${\sim}$\textbf{20K} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The LSTM~v1 offered only a marginal gain over the MLP (test AUC 0.756 vs.\ 0.751) due to severe overfitting: training accuracy reached 92\% while validation accuracy plateaued at 78\%, and validation loss diverged upward after epoch~10. The LSTM~v2 addressed this by (i)~team-swap data augmentation (doubling effective training size), (ii)~increased dropout (0.3$\to$0.5), (iii)~weight decay ($10^{-4}$), (iv)~reduced hidden size (64$\to$32), and (v)~gradient clipping. These changes dramatically improved generalization, raising test accuracy from 74.7\% to 90.7\% and test AUC from 0.756 to 0.953, all with ${\sim}$3$\times$ fewer parameters.
+
+\section*{Qualitative Results}
+
+Examining LSTM~v2 accuracy by rally length reveals that the model performs best on rallies with 2--4~rounds (accuracy above 90\%), where the sequential signal is strongest. Single-round rallies (e.g., aces, serve errors) still achieve ${\sim}$89\% accuracy, suggesting that serve-type features alone carry substantial predictive power.
+
+Representative test predictions illustrate the model's behavior:
+\begin{itemize}
+    \item \textbf{Confident correct:} Rally 8\_9 (2~rounds, prob\,=\,0.000) --- an exchange of hard-hit attacks with double blocks and block touches; the LSTM confidently predicts team~A.
+    \item \textbf{Correct long rally:} Rally 3\_27 (6~rounds, prob\,=\,0.042) --- the longest correctly predicted rally, involving dumps, free balls, and tips across six contacts.
+    \item \textbf{Uncertain wrong:} Rally 7\_131 (1~round, prob\,=\,0.537) --- a single-round rally ending in a kill from an out-of-system pass. The model's near-0.5 probability reflects genuine ambiguity when the outcome hinges on a single contact with mixed signals.
+    \item \textbf{Wrong:} Rally 0\_14 (3~rounds, prob\,=\,0.378) --- a rally containing a block touch followed by a free ball and then a quick-set kill. The model is misled by the free ball, which usually favors the attacking team.
+\end{itemize}
+
+Errors tend to occur in rallies where an apparently advantageous play (e.g., a free ball) does not convert into a point, or where a single-round outcome is inherently ambiguous.
+
+\section*{Evaluation on New Data}
+
+To assess generalization beyond the original VREN dataset, 30~rallies were hand-annotated from an external volleyball match video that was not part of the training, validation, or test splits. Annotation followed the VREN notation schema exactly. The LSTM~v2 model achieved:
+
+\begin{table}[h]
+    \centering
+    \caption{LSTM v2 performance on 30 externally annotated rallies.}
+    \label{tab:external}
+    \begin{tabular}{lc}
+        \toprule
+        \textbf{Metric} & \textbf{Value} \\
+        \midrule
+        Accuracy & 0.800 \\
+        ROC-AUC  & 0.891 \\
+        Loss     & 0.498 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The 10-point accuracy drop relative to the test set (90.7\%$\to$80.0\%) is expected given differences in team skill level, annotation style, and the small sample size. Nevertheless, an AUC of 0.891 on completely unseen data indicates that the model captures genuine volleyball patterns rather than overfitting to the training distribution.
+
+\section*{Discussion}
+
+The LSTM~v2 achieves a test AUC of 0.953 and an accuracy of 90.7\%, representing a 20-point accuracy gain over the MLP baseline. The key insight is that rally outcome depends on how play unfolds across multiple contacts: an out-of-system pass constrains the setter, which limits attacking options, which affects blocker positioning. The LSTM captures these dependencies naturally through its sequential hidden state, while the row-level MLP cannot.
+
+The transition from v1 to v2 highlights the importance of regularization in small-data regimes. With only 1{,}049~training rallies (and a median length of 1), v1 quickly memorized the training set. Team-swap augmentation was the single most impactful intervention: by doubling the effective dataset and forcing the model to learn team-agnostic patterns, it reduced the train-val accuracy gap from ${\sim}$15~points to ${\sim}$2~points. Reducing hidden size from 64 to 32 further constrained capacity, and dropout~0.5 provided additional noise-based regularization.
+
+On external data, accuracy drops to 80.0\% (AUC~0.891). Some of this gap may stem from the small external sample size (30~rallies) and inherent differences in match context (team strength, playing style). The single-round rally dominance (67.2\%) in the training data also means the model has less exposure to long-rally dynamics, which may differ across competition levels.
+
+A limitation of this approach is the reliance on hand-annotated structured data. The VREN notation requires expert annotation of each contact, which limits scalability. Future work could integrate computer vision pipelines---for example, pose estimation from broadcast video---to automate feature extraction. Additionally, attention mechanisms or Transformer-based architectures could provide more interpretable sequence representations and potentially improve performance on longer rallies.
+
+\section*{Ethical Considerations}
+
+Rally outcome prediction raises several ethical considerations. First, if deployed in competitive settings, the tool could create an uneven advantage for well-resourced programs that can afford dedicated analysts to annotate and model opponent data, widening the gap between elite and under-resourced teams. Second, the VREN dataset is drawn exclusively from professional and NCAA Division~I matches, introducing a bias toward high-level playing styles; predictions may not transfer to recreational or lower-division play where rally dynamics differ. Third, individual player performance data---such as pass ratings or attack tendencies---could be used to evaluate players without their knowledge or consent, raising privacy concerns. Finally, over-reliance on model predictions for in-game decisions could reduce the role of human judgment in coaching, potentially overlooking contextual factors (injuries, fatigue, morale) that the model cannot observe.
+
+\bibliographystyle{ieeetr}
+
+\begin{thebibliography}{5}
+
+\bibitem{vren}
+J.~Xia, N.~Tracy, S.~Zhao, K.~Fujii, X.~Wang, and P.~Peng,
+``{VREN}: Volleyball Rally Dataset with Expression Notation Language,''
+\emph{arXiv preprint arXiv:2209.13846}, 2022.
+
+\bibitem{lstm}
+S.~Hochreiter and J.~Schmidhuber,
+``Long Short-Term Memory,''
+\emph{Neural Computation}, vol.~9, no.~8, pp.~1735--1780, 1997.
+
+\bibitem{gnn}
+N.~Tracy, J.~Xia, A.~Rasla, X.~Wang, and S.~Singh,
+``Graph Encoding and Neural Network Approaches for Volleyball Analytics: From Game Outcome to Individual Play Predictions,''
+\emph{arXiv preprint arXiv:2308.11142}, 2023.
+
+\bibitem{bayesian}
+I.~Ntzoufras, V.~Palaskas, and S.~Drikos,
+``Bayesian Models for Prediction of the Set-Difference in Volleyball,''
+\emph{IMA Journal of Management Mathematics}, vol.~32, no.~4, pp.~491--518, 2021.
+
+\bibitem{mlvolley}
+Y.-H.~Chen, C.-H.~Chen, and T.-Y.~Wu,
+``Machine Learning in Sports Analytics: Volleyball Match Outcome Prediction,''
+in \emph{Proc.\ IEEE Int.\ Conf.\ on Consumer Electronics -- Taiwan (ICCE-TW)}, 2024.
+
+\end{thebibliography}
+
+\end{document}
