@@ -29,7 +29,7 @@
 
 \section*{Introduction}
 
-Volleyball is a fast-paced sport in which the outcome of each rally depends on a complex sequence of tactical decisions: serve placement, reception quality, set selection, attack type, and blocking response. Predicting which team wins a rally from this sequence of actions is valuable for coaching staff seeking data-driven tactical insights, such as identifying which offensive patterns lead to the highest kill rates or which defensive formations are most vulnerable. Because rallies are inherently sequential---earlier actions constrain later options---a machine learning approach that models temporal dependencies is well suited to this task. In particular, recurrent architectures such as Long Short-Term Memory (LSTM) networks~\cite{lstm} are designed to capture exactly this kind of ordered, variable-length structure, making them a natural fit for rally-level prediction.
+Volleyball is a fast-paced sport in which the outcome of each rally depends on a complex sequence of tactical decisions: serve placement, reception quality, set selection, attack type, and blocking response. Predicting which team wins a rally from this sequence of actions is valuable for coaching staff seeking data-driven tactical insights, such as identifying which offensive patterns lead to the highest kill rates or which defensive formations are most vulnerable. Because rallies are inherently sequential, a machine learning approach that models temporal dependencies is well suited to this task. In particular, recurrent architectures such as Long Short-Term Memory (LSTM) networks~\cite{lstm} are designed to capture exactly this kind of ordered, variable-length structure, making them a natural fit for rally-level prediction.
 
 This project formulates rally outcome prediction as binary classification (team~\texttt{a} vs.\ team~\texttt{b} wins) using the VREN (Volleyball Rally dataset with Expression Notation) dataset~\cite{vren}. A baseline feedforward network is first trained on one-hot encoded features to establish a lower bound. The primary model is a two-layer LSTM with learned embeddings and data augmentation that processes each rally as a sequence of rounds. The LSTM is then evaluated on a held-out test set and on 30 externally hand-annotated rallies to assess generalization. Figure~\ref{fig:pipeline} illustrates the full pipeline.
 
@@ -42,7 +42,7 @@ This project formulates rally outcome prediction as binary classification (team~
 
 \section*{Background and Related Work}
 
-Xia et al.~\cite{vren} introduced the VREN dataset and notation language for describing indoor volleyball rally processes. They proposed three analytical tasks---rally prediction, set-type prediction, and hit-type prediction---and trained simple neural baselines on the structured features. Tracy et al.~\cite{gnn} extended this work using graph neural networks with a specialized graph encoding that adds contact-by-contact context, achieving improved results on rally outcome and play-type prediction. Ntzoufras et al.~\cite{bayesian} developed Bayesian models (ordered multinomial logistic regression and truncated Skellam distributions) for predicting set-difference outcomes in professional volleyball, demonstrating that sport-specific statistical models can capture match dynamics. Chen et al.~\cite{mlvolley} applied Ridge Regression, Random Forest, Gradient Boosting, and LSTM models to predict volleyball match outcomes in the Taiwan Volleyball League, finding that ensemble methods with LASSO-based feature selection performed competitively with sequential models. Finally, the original LSTM architecture by Hochreiter and Schmidhuber~\cite{lstm} introduced gated memory cells for learning long-range dependencies, forming the foundation for the recurrent model used in this project.
+Xia et al.~\cite{vren} introduced the VREN dataset and notation language for describing indoor volleyball rally processes. They proposed three analytical tasks: rally prediction, set-type prediction, and hit-type prediction, and trained simple neural baselines on the structured features. Tracy et al.~\cite{gnn} extended this work using graph neural networks with a specialized graph encoding that adds contact-by-contact context, achieving improved results on rally outcome and play-type prediction. Ntzoufras et al.~\cite{bayesian} developed Bayesian models (ordered multinomial logistic regression and truncated Skellam distributions) for predicting set-difference outcomes in professional volleyball, demonstrating that sport-specific statistical models can capture match dynamics. Chen et al.~\cite{mlvolley} applied Ridge Regression, Random Forest, Gradient Boosting, and LSTM models to predict volleyball match outcomes in the Taiwan Volleyball League, finding that ensemble methods with LASSO-based feature selection performed competitively with sequential models. Finally, the original LSTM architecture by Hochreiter and Schmidhuber~\cite{lstm} introduced gated memory cells for learning long-range dependencies, forming the foundation for the recurrent model used in this project.
 
 \section*{Data Processing}
 
@@ -80,7 +80,7 @@ The model has approximately 56{,}000~parameters and was trained for 30~epochs wi
 
 \section*{Quantitative Results}
 
-Table~\ref{tab:results} compares all models on the held-out test set (225~rallies).
+Table~\ref{tab:results} compares all models. The MLP baseline was evaluated on its own row-level test split (365~rows), while the LSTM models were evaluated on a rally-level test split (225~rallies).
 
 \begin{table}[h]
     \centering
@@ -105,17 +105,17 @@ Examining LSTM~v2 accuracy by rally length reveals that the model performs best 
 
 Representative test predictions illustrate the model's behavior:
 \begin{itemize}
-    \item \textbf{Confident correct:} Rally 8\_9 (2~rounds, prob\,=\,0.000) --- an exchange of hard-hit attacks with double blocks and block touches; the LSTM confidently predicts team~A.
-    \item \textbf{Correct long rally:} Rally 3\_27 (6~rounds, prob\,=\,0.042) --- the longest correctly predicted rally, involving dumps, free balls, and tips across six contacts.
-    \item \textbf{Uncertain wrong:} Rally 7\_131 (1~round, prob\,=\,0.537) --- a single-round rally ending in a kill from an out-of-system pass. The model's near-0.5 probability reflects genuine ambiguity when the outcome hinges on a single contact with mixed signals.
-    \item \textbf{Wrong:} Rally 0\_14 (3~rounds, prob\,=\,0.378) --- a rally containing a block touch followed by a free ball and then a quick-set kill. The model is misled by the free ball, which usually favors the attacking team.
+    \item \textbf{Confident correct:} Rally 8\_9 (2~rounds, prob\,=\,0.000): an exchange of hard-hit attacks with double blocks and block touches; the LSTM confidently predicts team~A.
+    \item \textbf{Correct long rally:} Rally 3\_27 (6~rounds, prob\,=\,0.042): the longest correctly predicted rally, involving dumps, free balls, and tips across six contacts.
+    \item \textbf{Uncertain wrong:} Rally 7\_131 (1~round, prob\,=\,0.537): a single-round rally ending in a kill from an out-of-system pass. The model's near-0.5 probability reflects genuine ambiguity when the outcome hinges on a single contact with mixed signals.
+    \item \textbf{Wrong:} Rally 0\_14 (3~rounds, prob\,=\,0.378): a rally containing a block touch followed by a free ball and then a quick-set kill. The model is misled by the free ball, which usually favors the attacking team.
 \end{itemize}
 
 Errors tend to occur in rallies where an apparently advantageous play (e.g., a free ball) does not convert into a point, or where a single-round outcome is inherently ambiguous.
 
 \section*{Evaluation on New Data}
 
-To assess generalization beyond the original VREN dataset, 30~rallies were hand-annotated from an external volleyball match video that was not part of the training, validation, or test splits. Annotation followed the VREN notation schema exactly. The LSTM~v2 model achieved:
+To assess generalization beyond the original VREN dataset, 30~rallies were hand-annotated from the 2025 NCAA Div 1 Men's Finals match between Long Beach State and UCLA that was not part of the training, validation, or test splits. Annotation followed the VREN notation schema exactly. The LSTM~v2 model achieved:
 
 \begin{table}[h]
     \centering
@@ -146,7 +146,7 @@ A limitation of this approach is the reliance on hand-annotated structured data.
 
 \section*{Ethical Considerations}
 
-Rally outcome prediction raises several ethical considerations. First, if deployed in competitive settings, the tool could create an uneven advantage for well-resourced programs that can afford dedicated analysts to annotate and model opponent data, widening the gap between elite and under-resourced teams. Second, the VREN dataset is drawn exclusively from professional and NCAA Division~I matches, introducing a bias toward high-level playing styles; predictions may not transfer to recreational or lower-division play where rally dynamics differ. Third, individual player performance data---such as pass ratings or attack tendencies---could be used to evaluate players without their knowledge or consent, raising privacy concerns. Finally, over-reliance on model predictions for in-game decisions could reduce the role of human judgment in coaching, potentially overlooking contextual factors (injuries, fatigue, morale) that the model cannot observe.
+Rally outcome prediction raises several ethical considerations. First, if deployed in competitive settings, the tool could create an uneven advantage for well-resourced programs that can afford dedicated analysts to annotate and model opponent data, widening the gap between elite and under-resourced teams. Second, the VREN dataset is drawn exclusively from professional and NCAA Division~I matches, introducing a bias toward high-level playing styles; predictions may not transfer to recreational or lower-division play where rally dynamics differ. Third, individual player performance data, such as pass ratings or attack tendencies, could be used to evaluate players without their knowledge or consent, raising privacy concerns. Finally, over-reliance on model predictions for in-game decisions could reduce the role of human judgment in coaching, potentially overlooking contextual factors (injuries, fatigue, morale) that the model cannot observe.
 
 \bibliographystyle{ieeetr}
 
@@ -163,7 +163,7 @@ S.~Hochreiter and J.~Schmidhuber,
 \emph{Neural Computation}, vol.~9, no.~8, pp.~1735--1780, 1997.
 
 \bibitem{gnn}
-N.~Tracy, J.~Xia, A.~Rasla, X.~Wang, and S.~Singh,
+R.~Tracy, H.~Xia, A.~Rasla, Y.~Wang, and A.~Singh,
 ``Graph Encoding and Neural Network Approaches for Volleyball Analytics: From Game Outcome to Individual Play Predictions,''
 \emph{arXiv preprint arXiv:2308.11142}, 2023.
 
@@ -173,9 +173,9 @@ I.~Ntzoufras, V.~Palaskas, and S.~Drikos,
 \emph{IMA Journal of Management Mathematics}, vol.~32, no.~4, pp.~491--518, 2021.
 
 \bibitem{mlvolley}
-Y.-H.~Chen, C.-H.~Chen, and T.-Y.~Wu,
+H.-Y.~Lin, J.~Lien, and Y.-N.~Chang,
 ``Machine Learning in Sports Analytics: Volleyball Match Outcome Prediction,''
-in \emph{Proc.\ IEEE Int.\ Conf.\ on Consumer Electronics -- Taiwan (ICCE-TW)}, 2024.
+in \emph{2024 4th International Conference on Electrical, Computer, Communications and Mechatronics Engineering (ICECCME)}, 2024.
 
 \end{thebibliography}
 
