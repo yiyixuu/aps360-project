@@ -1,0 +1,30 @@
+# ─── Video files (too large for git) ──
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# ─── Model weights ──
+*.pt
+
+# ─── Generated outputs ──
+dataset.npz
+tracked_person_keypoints.csv
+
+# ─── Clip videos (regenerable from source) ──
+clips/*.mp4
+
+# ─── macOS ──
+.DS_Store
+
+# ─── Python ──
+__pycache__/
+*.pyc
+
+# ─── Course documents / reference files ──
+*.pdf
+*.xlsx
+
+# ─── Old exploration files ──
+pose_estimation.ipynb
+set.jpg
